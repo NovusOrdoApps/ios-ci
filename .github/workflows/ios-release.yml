@@ -1,0 +1,417 @@
+# Reusable workflow: Build and release an iOS app.
+#
+# Auto-detects:
+#   - Flutter vs native Xcode project
+#   - Workspace/project file location
+#   - Scheme, targets, bundle IDs, team ID
+#   - Generates ExportOptions.plist dynamically
+#
+# Required repo secrets (per-app):
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets (shared):
+#   CHECKOUT_PAT, MATCH_PASSWORD, MATCH_GIT_URL, MATCH_GIT_PAT
+#   DIAWI_TOKEN, TG_WORKER_API_KEY  (only needed if adhoc=true)
+
+name: iOS Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      adhoc:
+        description: "Also build ad-hoc IPA and upload to Diawi"
+        required: false
+        type: boolean
+        default: false
+      macos_runner:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-15"
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      scheme:
+        description: "Explicit Xcode scheme to build when the repo has multiple app schemes"
+        required: false
+        type: string
+        default: ""
+      configuration:
+        description: "Xcode configuration used for validation, detection, and native builds"
+        required: false
+        type: string
+        default: "Release"
+
+concurrency:
+  group: ios-release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build & Release iOS
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+
+    env:
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+    steps:
+      # ── Checkout ───────────────────────────────
+
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      # ── Setup tools ────────────────────────────
+
+      - name: Check if Flutter project
+        id: flutter_check
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            echo "is_flutter=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_flutter=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Flutter
+        if: steps.flutter_check.outputs.is_flutter == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Encode match git credentials
+        run: |
+          ENCODED=$(printf "pat:%s" "${{ secrets.MATCH_GIT_PAT }}" | base64 | tr -d '\n')
+          echo "MATCH_GIT_BASIC_AUTHORIZATION=$ENCODED" >> "$GITHUB_ENV"
+
+      - name: Create CI keychain
+        working-directory: _ci
+        run: bundle exec fastlane setup_keychain
+
+      # ── Run app-specific prepare script (if exists) ──
+      # Must run BEFORE detect — some projects generate xcconfigs
+      # that xcodebuild needs to resolve bundle IDs and team ID.
+
+      - name: Run prepare script
+        run: |
+          if [ -f "./scripts/prepare.sh" ]; then
+            echo ":: Found scripts/prepare.sh, running..."
+            chmod +x ./scripts/prepare.sh
+            ./scripts/prepare.sh
+          else
+            echo ":: No scripts/prepare.sh found, skipping."
+          fi
+
+      - name: Locate Xcode project
+        id: locate
+        run: bash _ci/scripts/detect-project.sh . "" "${{ inputs.configuration }}" locate-only
+
+      - name: Install CocoaPods dependencies
+        run: |
+          IOS_DIR="${{ steps.locate.outputs.ios_dir }}"
+          if [ -f "$IOS_DIR/Podfile" ]; then
+            echo ":: Found Podfile, running pod install before validation..."
+            cd "$IOS_DIR"
+            pod install
+          else
+            echo ":: No Podfile found, skipping."
+          fi
+
+      # ── Detect project structure ───────────────
+
+      - name: Detect Xcode project
+        id: detect
+        run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}"
+
+      - name: Print detection results
+        run: |
+          echo "Flutter:    ${{ steps.detect.outputs.is_flutter }}"
+          echo "Workspace:  ${{ steps.detect.outputs.workspace }}"
+          echo "Project:    ${{ steps.detect.outputs.project }}"
+          echo "iOS dir:    ${{ steps.detect.outputs.ios_dir }}"
+          echo "Scheme:     ${{ steps.detect.outputs.scheme }}"
+          echo "Config:     ${{ steps.detect.outputs.configuration }}"
+          echo "Team ID:    ${{ steps.detect.outputs.team_id }}"
+          echo "Bundle IDs: ${{ steps.detect.outputs.app_identifiers }}"
+          echo "Targets:    ${{ steps.detect.outputs.targets_json }}"
+
+      - name: Validate xcconfig release contract
+        working-directory: _ci
+        run: |
+          bundle exec ruby scripts/validate-project-contract.rb \
+            "$GITHUB_WORKSPACE" \
+            "${{ steps.detect.outputs.project }}" \
+            "${{ steps.detect.outputs.configuration }}" \
+            '${{ steps.detect.outputs.targets_json }}'
+
+      - name: Validate Flutter build inputs
+        if: steps.detect.outputs.is_flutter == 'true'
+        run: |
+          if [ "${{ steps.detect.outputs.configuration }}" != "Release" ]; then
+            echo "ERROR: Flutter builds currently support only configuration=Release in ios-ci. Keep configuration at Release and use scheme/flavor overrides if needed." >&2
+            exit 1
+          fi
+
+      # ── Generate ExportOptions ─────────────────
+
+      - name: Generate ExportOptions plists
+        run: |
+          mkdir -p build/export-options
+          bash _ci/scripts/generate-export-options.sh \
+            "app-store" \
+            "${{ steps.detect.outputs.team_id }}" \
+            '${{ steps.detect.outputs.targets_json }}' \
+            "build/export-options/AppStore.plist"
+
+          bash _ci/scripts/generate-export-options.sh \
+            "ad-hoc" \
+            "${{ steps.detect.outputs.team_id }}" \
+            '${{ steps.detect.outputs.targets_json }}' \
+            "build/export-options/AdHoc.plist"
+
+      # ══════════════════════════════════════════════
+      # BUILD: App Store IPA
+      # ══════════════════════════════════════════════
+
+      - name: Install app-store signing profiles
+        working-directory: _ci
+        run: |
+          bundle exec fastlane install_profiles \
+            type:appstore \
+            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}"
+
+      - name: Set app-store code signing
+        working-directory: _ci
+        run: |
+          bundle exec fastlane set_signing \
+            type:appstore \
+            targets_json:'${{ steps.detect.outputs.targets_json }}' \
+            team_id:"${{ steps.detect.outputs.team_id }}" \
+            xcodeproj:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}"
+
+      - name: Build app-store IPA
+        run: |
+          if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
+            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AppStore.plist)
+            if [ "${{ steps.detect.outputs.scheme }}" != "Runner" ]; then
+              FLUTTER_ARGS+=(--flavor "${{ steps.detect.outputs.scheme }}")
+            fi
+            flutter "${FLUTTER_ARGS[@]}"
+          else
+            cd _ci
+            bundle exec fastlane build_native \
+              workspace:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.workspace }}" \
+              project:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}" \
+              scheme:"${{ steps.detect.outputs.scheme }}" \
+              configuration:"${{ steps.detect.outputs.configuration }}" \
+              export_options:"$GITHUB_WORKSPACE/build/export-options/AppStore.plist"
+          fi
+
+      - name: Collect app-store IPA
+        run: |
+          mkdir -p build/artifacts
+          if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
+            cp build/ios/ipa/*.ipa build/artifacts/AppStore.ipa
+          else
+            cp _ci/build/artifacts/App.ipa build/artifacts/AppStore.ipa
+          fi
+
+      # ── Upload dSYMs to Crashlytics (if available) ──
+
+      - name: Upload dSYMs to Crashlytics
+        continue-on-error: true
+        run: |
+          # Find the upload-symbols binary (could be in Pods of the app repo)
+          IOS_DIR="${{ steps.detect.outputs.ios_dir }}"
+          UPLOAD_SYMBOLS=$(find "$IOS_DIR" -path "*/FirebaseCrashlytics/upload-symbols" 2>/dev/null | head -1)
+          GSP_PATH=$(find "$IOS_DIR" -name "GoogleService-Info.plist" -not -path "*/Pods/*" 2>/dev/null | head -1)
+
+          if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
+            DSYM_PATH="build/ios/archive/Runner.xcarchive/dSYMs"
+          else
+            DSYM_ZIP=$(find _ci/build/artifacts -name "*.dSYM.zip" 2>/dev/null | head -1)
+            if [ -n "$DSYM_ZIP" ]; then
+              DSYM_TMP="$RUNNER_TEMP/native-dsyms"
+              rm -rf "$DSYM_TMP"
+              mkdir -p "$DSYM_TMP"
+              unzip -q "$DSYM_ZIP" -d "$DSYM_TMP"
+              DSYM_PATH="$DSYM_TMP"
+            else
+              DSYM_PATH=$(find _ci/build -name "*.dSYM" -type d 2>/dev/null | head -1)
+              DSYM_PATH="${DSYM_PATH%/*}"  # parent directory
+            fi
+          fi
+
+          if [ -n "$UPLOAD_SYMBOLS" ] && [ -n "$GSP_PATH" ] && [ -d "$DSYM_PATH" ]; then
+            "$UPLOAD_SYMBOLS" -gsp "$GSP_PATH" -p ios "$DSYM_PATH"
+            echo ":: dSYMs uploaded."
+          else
+            echo ":: Skipping Crashlytics dSYM upload (not configured)."
+          fi
+
+      # ── Upload to TestFlight ───────────────────
+
+      - name: Upload to TestFlight
+        working-directory: _ci
+        env:
+          IPA_PATH: ${{ github.workspace }}/build/artifacts/AppStore.ipa
+        run: bundle exec fastlane upload_testflight_ipa
+
+      # ══════════════════════════════════════════════
+      # BUILD: Ad-Hoc IPA (conditional)
+      # ══════════════════════════════════════════════
+
+      - name: Install ad-hoc signing profiles
+        if: inputs.adhoc
+        working-directory: _ci
+        run: |
+          bundle exec fastlane install_profiles \
+            type:adhoc \
+            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}"
+
+      - name: Set ad-hoc code signing
+        if: inputs.adhoc
+        working-directory: _ci
+        run: |
+          bundle exec fastlane set_signing \
+            type:adhoc \
+            targets_json:'${{ steps.detect.outputs.targets_json }}' \
+            team_id:"${{ steps.detect.outputs.team_id }}" \
+            xcodeproj:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}"
+
+      - name: Build ad-hoc IPA
+        if: inputs.adhoc
+        run: |
+          if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
+            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AdHoc.plist)
+            if [ "${{ steps.detect.outputs.scheme }}" != "Runner" ]; then
+              FLUTTER_ARGS+=(--flavor "${{ steps.detect.outputs.scheme }}")
+            fi
+            flutter "${FLUTTER_ARGS[@]}"
+          else
+            cd _ci
+            bundle exec fastlane build_native \
+              workspace:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.workspace }}" \
+              project:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}" \
+              scheme:"${{ steps.detect.outputs.scheme }}" \
+              configuration:"${{ steps.detect.outputs.configuration }}" \
+              export_options:"$GITHUB_WORKSPACE/build/export-options/AdHoc.plist"
+          fi
+
+      - name: Collect ad-hoc IPA
+        if: inputs.adhoc
+        run: |
+          if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
+            cp build/ios/ipa/*.ipa build/artifacts/AdHoc.ipa
+          else
+            cp _ci/build/artifacts/App.ipa build/artifacts/AdHoc.ipa
+          fi
+
+      - name: Attach ad-hoc IPA to GitHub Release
+        if: inputs.adhoc && github.event.release.tag_name
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/artifacts/AdHoc.ipa
+
+      - name: Upload to Diawi & notify Telegram
+        if: inputs.adhoc
+        continue-on-error: true
+        env:
+          DIAWI_TOKEN: ${{ secrets.DIAWI_TOKEN }}
+          TG_WORKER_API_KEY: ${{ secrets.TG_WORKER_API_KEY }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME:-manual-${GITHUB_RUN_NUMBER}}"
+          fi
+
+          RELEASE_NAME="${{ github.event.release.name }}"
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="Manual ad-hoc build"
+          fi
+
+          RESPONSE=$(curl -s https://upload.diawi.com/ \
+            -F token="$DIAWI_TOKEN" \
+            -F file=@build/artifacts/AdHoc.ipa \
+            -F find_by_udid=0 \
+            -F wall_of_apps=0 \
+            -F comment="$TAG")
+
+          JOB_ID=$(echo "$RESPONSE" | jq -r '.job')
+          if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
+            echo "ERROR: Diawi upload failed: $RESPONSE"
+            exit 1
+          fi
+          echo "Diawi job: $JOB_ID"
+
+          for i in $(seq 1 10); do
+            sleep 3
+            STATUS=$(curl -s "https://upload.diawi.com/status?token=$DIAWI_TOKEN&job=$JOB_ID")
+            CODE=$(echo "$STATUS" | jq -r '.status')
+            echo "Poll $i: status=$CODE"
+
+            if [ "$CODE" = "2000" ]; then
+              LINK=$(echo "$STATUS" | jq -r '.link')
+              echo "Diawi link: $LINK"
+
+              if [ -n "$TG_WORKER_API_KEY" ]; then
+                REPO_NAME="${{ github.event.repository.name }}"
+                MSG="${REPO_NAME} build available!\n\n${RELEASE_NAME}\nVersion: ${TAG}\n\nInstall: ${LINK}"
+                curl -s -X POST \
+                  "https://support-email-to-telegram.novusordovpn.workers.dev/" \
+                  -H "Content-Type: application/json" \
+                  -H "X-API-Key: $TG_WORKER_API_KEY" \
+                  -d "{\"message\": \"$MSG\"}"
+                echo ""
+                echo "Telegram notification sent."
+              fi
+              exit 0
+            elif [ "$CODE" != "2001" ]; then
+              echo "ERROR: Diawi processing failed: $STATUS"
+              exit 1
+            fi
+          done
+          echo "ERROR: Diawi processing timed out after 30s"
+          exit 1
+
+      # ── Cleanup ────────────────────────────────
+
+      - name: Delete CI keychain
+        if: always()
+        run: security delete-keychain fastlane_ci.keychain || true
+
+      - name: Remove API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"

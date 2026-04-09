@@ -1,0 +1,124 @@
+default_platform(:ios)
+
+platform :ios do
+
+  # ──────────────────────────────────────────────
+  # setup_keychain
+  # ──────────────────────────────────────────────
+  lane :setup_keychain do
+    create_keychain(
+      name: "fastlane_ci",
+      password: "ci",
+      default_keychain: true,
+      unlock: true,
+      timeout: 3600,
+      lock_when_sleeps: false,
+      add_to_search_list: true,
+    )
+  end
+
+  # ──────────────────────────────────────────────
+  # install_profiles
+  #
+  # Usage: bundle exec fastlane install_profiles \
+  #          type:appstore \
+  #          app_identifiers:"com.foo.app,com.foo.app.widget"
+  # ──────────────────────────────────────────────
+  lane :install_profiles do |options|
+    type = options[:type]
+    ids = options[:app_identifiers].split(",")
+
+    UI.user_error!("Missing 'type'") unless type
+    UI.user_error!("Missing 'app_identifiers'") if ids.empty?
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    match_opts = {
+      type: type.to_s,
+      api_key: api_key,
+      app_identifier: ids,
+      keychain_name: "fastlane_ci",
+      keychain_password: "ci",
+      readonly: false,
+    }
+
+    match_opts[:force_for_new_devices] = true if type.to_s == "adhoc"
+
+    match(match_opts)
+  end
+
+  # ──────────────────────────────────────────────
+  # set_signing
+  #
+  # Usage: bundle exec fastlane set_signing \
+  #          type:appstore \
+  #          targets_json:'[{"name":"Runner","bundle_id":"com.foo.app"}, ...]' \
+  #          team_id:XXXXX \
+  #          xcodeproj:Runner.xcodeproj
+  # ──────────────────────────────────────────────
+  lane :set_signing do |options|
+    type = options[:type]
+    team_id = options[:team_id]
+    xcodeproj = options[:xcodeproj]
+    targets = JSON.parse(options[:targets_json])
+
+    match_type = type.to_s == "appstore" ? "AppStore" : "AdHoc"
+
+    targets.each do |t|
+      UI.message("Setting signing for target '#{t['name']}' → #{t['bundle_id']}")
+      update_code_signing_settings(
+        use_automatic_signing: false,
+        team_id: team_id,
+        targets: [t["name"]],
+        profile_name: "match #{match_type} #{t['bundle_id']}",
+        code_sign_identity: "Apple Distribution",
+        bundle_identifier: t["bundle_id"],
+        path: xcodeproj,
+      )
+    end
+  end
+
+  # ──────────────────────────────────────────────
+  # upload_testflight_ipa
+  # ──────────────────────────────────────────────
+  lane :upload_testflight_ipa do
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ENV.fetch("IPA_PATH"),
+      skip_waiting_for_build_processing: true,
+    )
+  end
+
+  # ──────────────────────────────────────────────
+  # build_native
+  #
+  # Builds a non-Flutter Xcode project.
+  # Usage: bundle exec fastlane build_native \
+  #          workspace:App.xcworkspace \
+  #          scheme:App \
+  #          export_options:/path/to/ExportOptions.plist
+  # ──────────────────────────────────────────────
+  lane :build_native do |options|
+    build_app(
+      workspace: options[:workspace].to_s.empty? ? nil : options[:workspace],
+      project: options[:project].to_s.empty? ? nil : options[:project],
+      scheme: options[:scheme],
+      configuration: options[:configuration].to_s.empty? ? "Release" : options[:configuration],
+      export_options: options[:export_options],
+      output_directory: "build/artifacts",
+      output_name: "App.ipa",
+      clean: true,
+    )
+  end
+
+end
