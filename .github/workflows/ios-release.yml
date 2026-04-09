@@ -64,6 +64,9 @@ jobs:
       MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
       APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
       APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      IOS_RELEASE_TEAM_ID: ${{ vars.IOS_RELEASE_TEAM_ID }}
+      IOS_RELEASE_APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+      IOS_RELEASE_EXTENSION_BUNDLE_ID: ${{ vars.IOS_RELEASE_EXTENSION_BUNDLE_ID }}
 
     steps:
       # ── Checkout ───────────────────────────────

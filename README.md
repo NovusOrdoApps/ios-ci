@@ -2,7 +2,7 @@
 
 Shared iOS CI/CD infrastructure for NovusOrdo app repositories. App repos keep a tiny caller workflow, while this repo handles signing, building, TestFlight upload, and optional ad-hoc distribution.
 
-The CI is zero-config on the GitHub side, but not magic on the Xcode side: every app repo must expose its release identity through `.xcconfig` files so CI can publish using your organization-owned team and bundle IDs without opening Xcode.
+The CI is low-config on the GitHub side, but not magic on the Xcode side: every app repo must expose its release identity through `.xcconfig` files so CI can publish using your organization-owned team and bundle IDs without opening Xcode.
 
 ## How it works
 
@@ -18,9 +18,9 @@ When a GitHub Release is created in any app repo, the thin caller workflow invok
 
 1. Checks out the app repo and this `ios-ci` repo
 2. Runs `scripts/prepare.sh` if it exists in the app repo
-3. Auto-detects the Xcode project structure (workspace, scheme, targets, bundle IDs, team ID)
-4. Installs CocoaPods dependencies if a `Podfile` is present
-5. Detects whether it's a Flutter or native project
+3. Locates the Xcode project structure and installs CocoaPods dependencies if a `Podfile` is present
+4. Detects whether it's a Flutter or native project
+5. Auto-detects the workspace, scheme, targets, bundle IDs, and team ID
 6. Validates that the chosen release configuration is xcconfig-driven and resolves your org-owned team and bundle IDs
 7. Generates `ExportOptions.plist` dynamically from detected bundle IDs
 8. Signs all targets via fastlane match
@@ -38,6 +38,38 @@ Every app repo that uses `ios-ci` must follow this release contract:
 
 This is what lets a freelancer work with their own local setup while your CI publishes with your organization-owned identifiers.
 
+### Recommended separation: local Debug, CI Release
+
+The cleanest pattern is:
+
+- local development writes `Config/Local.Debug.generated.xcconfig`
+- CI writes `Config/CI.Release.generated.xcconfig`
+- Debug includes the local file
+- Release includes the CI file
+
+That keeps org release identifiers out of local machines while still letting CI validate and ship Release builds.
+Developers run `Debug` locally; CI alone generates the real Release identity in its ephemeral workspace.
+
+Example:
+
+```xcconfig
+// Config/Base.xcconfig
+DEVELOPMENT_TEAM = $(APPLE_TEAM_ID)
+PRODUCT_BUNDLE_IDENTIFIER = $(APP_BUNDLE_ID)
+```
+
+```xcconfig
+// Config/Debug.xcconfig
+#include "Base.xcconfig"
+#include? "Local.Debug.generated.xcconfig"
+```
+
+```xcconfig
+// Config/Release.xcconfig
+#include "Base.xcconfig"
+#include? "CI.Release.generated.xcconfig"
+```
+
 ### Recommended pattern
 
 In the committed Xcode project, wire targets to variables:
@@ -53,7 +85,7 @@ For extensions, use a separate variable:
 PRODUCT_BUNDLE_IDENTIFIER = $(APP_EXTENSION_BUNDLE_ID)
 ```
 
-Then define the real org-owned values in a release xcconfig or generate them in `scripts/prepare.sh`:
+Then generate the real org-owned Release values in CI:
 
 ```xcconfig
 APPLE_TEAM_ID = ABCDE12345
@@ -131,7 +163,21 @@ SomeFolder/
 
 > If all apps share the same Apple Developer account, these 3 can also be moved to org-level secrets.
 >
-> CI does not need a separate secret for bundle ID or team ID. Those must come from the app repo's xcconfig-driven release configuration.
+> CI does not need separate workflow inputs for bundle ID or team ID. Those must come from the app repo's xcconfig-driven release configuration.
+
+### GitHub Actions variables for CI-generated release config
+
+If you do not want release identifiers committed to the repo, store them as GitHub Actions configuration variables and let `scripts/prepare.sh` generate the release xcconfig from them.
+
+Standard variable names exposed by `ios-ci` to `scripts/prepare.sh`:
+
+| Variable | Purpose |
+|---|---|
+| `IOS_RELEASE_TEAM_ID` | Apple team ID for Release / TestFlight builds |
+| `IOS_RELEASE_APP_BUNDLE_ID` | Main app bundle ID for Release / TestFlight builds |
+| `IOS_RELEASE_EXTENSION_BUNDLE_ID` | Optional extension bundle ID |
+
+For apps with more identifiers than these defaults cover, keep using `scripts/prepare.sh` and extend it with app-specific variables.
 
 ## Optional inputs
 
@@ -147,7 +193,7 @@ The caller workflow can override these defaults:
 
 ## Prepare script
 
-If your app needs custom steps before the build, create `scripts/prepare.sh` in your app repo. This is the right place to generate org-owned xcconfig files, copy release secrets into config files, or run code generators before CI validates the project contract.
+If your app needs custom steps before the build, create `scripts/prepare.sh` in your app repo. This is the right place to generate CI-only release xcconfig files from GitHub variables, copy release secrets into config files, or run code generators before CI validates the project contract.
 
 Example:
 
@@ -155,8 +201,12 @@ Example:
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate release xcconfig files with the org-owned team and bundle IDs
-dart run scripts/generate_release_xcconfigs.dart --prod
+# Generate a CI-only release xcconfig from GitHub Actions variables
+cat > Config/CI.Release.generated.xcconfig <<EOF
+APPLE_TEAM_ID = ${IOS_RELEASE_TEAM_ID}
+APP_BUNDLE_ID = ${IOS_RELEASE_APP_BUNDLE_ID}
+APP_EXTENSION_BUNDLE_ID = ${IOS_RELEASE_EXTENSION_BUNDLE_ID}
+EOF
 ```
 
 ## Files in this repo
