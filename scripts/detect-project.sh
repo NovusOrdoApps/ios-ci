@@ -210,7 +210,7 @@ if [ -z "$APP_IDS" ]; then
   exit 1
 fi
 
-if [ -z "$TEAM_ID" ]; then
+if [ -z "$TEAM_ID" ] && [ "$MODE" != "prepatch" ]; then
   echo "ERROR: No DEVELOPMENT_TEAM was resolved for scheme '$SCHEME' configuration '$CONFIGURATION'" >&2
   exit 1
 fi
@@ -219,6 +219,10 @@ echo "targets_json=$TARGETS_JSON" >> "$GITHUB_OUTPUT"
 echo "app_identifiers=$APP_IDS" >> "$GITHUB_OUTPUT"
 echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
 
-echo ":: Team ID: $TEAM_ID"
+if [ -n "$TEAM_ID" ]; then
+  echo ":: Team ID: $TEAM_ID"
+else
+  echo ":: Team ID unresolved in mode '$MODE' (allowed during prepatch discovery)"
+fi
 echo ":: App identifiers: $APP_IDS"
 echo ":: Detection complete."

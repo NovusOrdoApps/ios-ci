@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: "Release"
+      release_identity_mode:
+        description: "How ios-ci applies release team and bundle IDs: 'managed' patches the project in CI, 'xcconfig' expects the app repo to provide them"
+        required: false
+        type: string
+        default: "managed"
 
 concurrency:
   group: ios-release-${{ github.repository }}-${{ github.ref }}
@@ -67,6 +72,7 @@ jobs:
       IOS_RELEASE_TEAM_ID: ${{ vars.IOS_RELEASE_TEAM_ID }}
       IOS_RELEASE_APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
       IOS_RELEASE_EXTENSION_BUNDLE_ID: ${{ vars.IOS_RELEASE_EXTENSION_BUNDLE_ID }}
+      IOS_RELEASE_TARGET_BUNDLE_IDS_JSON: ${{ vars.IOS_RELEASE_TARGET_BUNDLE_IDS_JSON }}
 
     steps:
       # ── Checkout ───────────────────────────────
@@ -123,6 +129,17 @@ jobs:
         working-directory: _ci
         run: bundle exec fastlane setup_keychain
 
+      - name: Validate release identity mode
+        run: |
+          case "${{ inputs.release_identity_mode }}" in
+            managed|xcconfig)
+              ;;
+            *)
+              echo "ERROR: Unsupported release_identity_mode='${{ inputs.release_identity_mode }}'. Use 'managed' or 'xcconfig'." >&2
+              exit 1
+              ;;
+          esac
+
       # ── Run app-specific prepare script (if exists) ──
       # Must run BEFORE detect — some projects generate xcconfigs
       # that xcodebuild needs to resolve bundle IDs and team ID.
@@ -152,9 +169,27 @@ jobs:
             echo ":: No Podfile found, skipping."
           fi
 
-      # ── Detect project structure ───────────────
+      # ── Discover scheme / targets before optional CI-managed patching ──
 
-      - name: Detect Xcode project
+      - name: Pre-detect Xcode project
+        id: detect_pre
+        run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}" prepatch
+
+      - name: Apply CI-managed release identity
+        if: inputs.release_identity_mode == 'managed'
+        working-directory: _ci
+        run: |
+          : "${IOS_RELEASE_TEAM_ID:?Missing GitHub Actions variable IOS_RELEASE_TEAM_ID}"
+          : "${IOS_RELEASE_APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          bundle exec ruby scripts/manage-release-identity.rb \
+            "$GITHUB_WORKSPACE" \
+            "${{ steps.detect_pre.outputs.project }}" \
+            "${{ steps.detect_pre.outputs.configuration }}" \
+            '${{ steps.detect_pre.outputs.targets_json }}'
+
+      # ── Detect final project structure ─────────
+
+      - name: Detect patched Xcode project
         id: detect
         run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}"
 
@@ -171,6 +206,7 @@ jobs:
           echo "Targets:    ${{ steps.detect.outputs.targets_json }}"
 
       - name: Validate xcconfig release contract
+        if: inputs.release_identity_mode == 'xcconfig'
         working-directory: _ci
         run: |
           bundle exec ruby scripts/validate-project-contract.rb \
@@ -178,6 +214,23 @@ jobs:
             "${{ steps.detect.outputs.project }}" \
             "${{ steps.detect.outputs.configuration }}" \
             '${{ steps.detect.outputs.targets_json }}'
+
+      - name: Validate CI-managed release identity
+        if: inputs.release_identity_mode == 'managed'
+        env:
+          DETECTED_TARGETS_JSON: ${{ steps.detect.outputs.targets_json }}
+        run: |
+          if [ "${{ steps.detect.outputs.team_id }}" != "$IOS_RELEASE_TEAM_ID" ]; then
+            echo "ERROR: ios-ci patched DEVELOPMENT_TEAM to '$IOS_RELEASE_TEAM_ID', but xcodebuild resolved '${{ steps.detect.outputs.team_id }}'." >&2
+            exit 1
+          fi
+
+          echo "$DETECTED_TARGETS_JSON" | jq -e --arg bundle_id "$IOS_RELEASE_APP_BUNDLE_ID" '
+            any(.[]; .product_type == "com.apple.product-type.application" and .bundle_id == $bundle_id)
+          ' >/dev/null || {
+            echo "ERROR: ios-ci patched release identity, but no application target resolved PRODUCT_BUNDLE_IDENTIFIER=$IOS_RELEASE_APP_BUNDLE_ID." >&2
+            exit 1
+          }
 
       - name: Validate Flutter build inputs
         if: steps.detect.outputs.is_flutter == 'true'

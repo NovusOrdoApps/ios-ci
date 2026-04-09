@@ -2,7 +2,7 @@
 
 Shared iOS CI/CD infrastructure for NovusOrdo app repositories. App repos keep a tiny caller workflow, while this repo handles signing, building, TestFlight upload, and optional ad-hoc distribution.
 
-The CI is low-config on the GitHub side, but not magic on the Xcode side: every app repo must expose its release identity through `.xcconfig` files so CI can publish using your organization-owned team and bundle IDs without opening Xcode.
+By default, app repos do not need release xcconfig wiring. `ios-ci` patches the chosen Xcode configuration inside the GitHub Actions runner so CI can publish using your organization-owned team and bundle IDs without changing the delivered project by hand.
 
 ## How it works
 
@@ -20,80 +20,72 @@ When a GitHub Release is created in any app repo, the thin caller workflow invok
 2. Runs `scripts/prepare.sh` if it exists in the app repo
 3. Locates the Xcode project structure and installs CocoaPods dependencies if a `Podfile` is present
 4. Detects whether it's a Flutter or native project
-5. Auto-detects the workspace, scheme, targets, bundle IDs, and team ID
-6. Validates that the chosen release configuration is xcconfig-driven and resolves your org-owned team and bundle IDs
-7. Generates `ExportOptions.plist` dynamically from detected bundle IDs
-8. Signs all targets via fastlane match
-9. Builds the IPA and uploads to TestFlight
-10. Optionally builds an ad-hoc IPA and uploads to Diawi
+5. Pre-detects the workspace, scheme, and signable targets from the delivered project
+6. In the default `managed` mode, patches the chosen configuration in CI with your release team ID and bundle IDs
+7. Re-detects the final bundle IDs and team ID after patching
+8. Generates `ExportOptions.plist` dynamically from detected bundle IDs
+9. Signs all targets via fastlane match
+10. Builds the IPA and uploads to TestFlight
+11. Optionally builds an ad-hoc IPA and uploads to Diawi
 
-## Mandatory project convention
+## Default consumer contract
 
-Every app repo that uses `ios-ci` must follow this release contract:
+For a standard app repo, the default setup is just:
+
+1. Copy the `.github/workflows/release.yml` caller file
+2. Add 3 App Store Connect secrets
+3. Add 2 GitHub Actions variables
+
+In this default `managed` mode, `ios-ci` uses `xcodeproj` in CI to patch the selected Xcode configuration:
+
+- `DEVELOPMENT_TEAM` -> `IOS_RELEASE_TEAM_ID`
+- the main application target `PRODUCT_BUNDLE_IDENTIFIER` -> `IOS_RELEASE_APP_BUNDLE_ID`
+- extension bundle IDs are derived automatically when they share the main app bundle prefix
+
+This means the delivered Xcode project can stay mostly as-is for CI release automation.
+
+### Required repo variables
+
+| Variable | Purpose |
+|---|---|
+| `IOS_RELEASE_TEAM_ID` | Apple team ID for Release / TestFlight builds |
+| `IOS_RELEASE_APP_BUNDLE_ID` | Main app bundle ID for Release / TestFlight builds |
+
+### Optional advanced variables
+
+Most apps do not need these. They are only for projects whose secondary targets cannot be derived from the main bundle ID automatically.
+
+| Variable | Purpose |
+|---|---|
+| `IOS_RELEASE_EXTENSION_BUNDLE_ID` | Optional exact bundle ID when there is exactly one extension target |
+| `IOS_RELEASE_TARGET_BUNDLE_IDS_JSON` | Optional JSON map of target name -> bundle ID for complex apps |
+
+Example:
+
+```json
+{"WidgetExtension":"com.novusordo.myapp.widget","NotificationService":"com.novusordo.myapp.notification-service"}
+```
+
+If a secondary target's delivered bundle ID does not share the main app prefix, `ios-ci` fails early and tells you to use one of these overrides or the advanced xcconfig mode below.
+
+## Advanced: xcconfig-managed mode
+
+If you want the app repo itself to define release identity through `.xcconfig` files, `ios-ci` still supports that. Set `release_identity_mode: "xcconfig"` in the caller workflow.
+
+Use this mode when:
+
+- you want the project to be fully self-describing for release identity
+- you want a clean local Debug / CI Release split in the app repo
+- your target IDs or entitlements are too custom for CI-managed derivation
+
+In `xcconfig` mode, the app repo must follow this contract:
 
 1. The shipping Xcode configuration must reference one or more `.xcconfig` files.
 2. Release signing identity must come from those `.xcconfig` files, not from hardcoded values in the `.pbxproj`.
 3. The chosen configuration must resolve `DEVELOPMENT_TEAM` and `PRODUCT_BUNDLE_IDENTIFIER` for every signable target.
 4. If values are generated, the repo must create them in `scripts/prepare.sh` before CI detection runs.
 
-This is what lets a freelancer work with their own local setup while your CI publishes with your organization-owned identifiers.
-
-### Recommended separation: local Debug, CI Release
-
-The cleanest pattern is:
-
-- local development writes `Config/Local.Debug.generated.xcconfig`
-- CI writes `Config/CI.Release.generated.xcconfig`
-- Debug includes the local file
-- Release includes the CI file
-
-That keeps org release identifiers out of local machines while still letting CI validate and ship Release builds.
-Developers run `Debug` locally; CI alone generates the real Release identity in its ephemeral workspace.
-
-Example:
-
-```xcconfig
-// Config/Base.xcconfig
-DEVELOPMENT_TEAM = $(APPLE_TEAM_ID)
-PRODUCT_BUNDLE_IDENTIFIER = $(APP_BUNDLE_ID)
-```
-
-```xcconfig
-// Config/Debug.xcconfig
-#include "Base.xcconfig"
-#include? "Local.Debug.generated.xcconfig"
-```
-
-```xcconfig
-// Config/Release.xcconfig
-#include "Base.xcconfig"
-#include? "CI.Release.generated.xcconfig"
-```
-
-### Recommended pattern
-
-In the committed Xcode project, wire targets to variables:
-
-```xcconfig
-DEVELOPMENT_TEAM = $(APPLE_TEAM_ID)
-PRODUCT_BUNDLE_IDENTIFIER = $(APP_BUNDLE_ID)
-```
-
-For extensions, use a separate variable:
-
-```xcconfig
-PRODUCT_BUNDLE_IDENTIFIER = $(APP_EXTENSION_BUNDLE_ID)
-```
-
-Then generate the real org-owned Release values in CI:
-
-```xcconfig
-APPLE_TEAM_ID = ABCDE12345
-APP_BUNDLE_ID = com.novusordo.myapp
-APP_EXTENSION_BUNDLE_ID = com.novusordo.myapp.widget
-```
-
-The workflow now validates this contract before any signing or build steps. It fails early with a clear error if:
+The workflow validates this contract before any signing or build steps. It fails early with a clear error if:
 
 - no `.xcconfig` is referenced for the chosen configuration
 - the referenced `.xcconfig` file does not exist
@@ -110,7 +102,8 @@ The workflow automatically discovers:
 | .xcworkspace / .xcodeproj | Searches root, then `ios/`, then any first-level subdirectory |
 | Scheme | `xcodebuild -list`, filters out Pods/Tests/Widget schemes |
 | Targets + bundle IDs | `xcodebuild -showBuildSettings` for the selected scheme/configuration |
-| Team ID | From the first target's `DEVELOPMENT_TEAM` build setting |
+| Release identity in default mode | Patched in CI with `xcodeproj` before the final detection pass |
+| Team ID | From the final detected `DEVELOPMENT_TEAM` build setting after patching |
 | CocoaPods | Runs `pod install` before validation if a Podfile exists |
 | Crashlytics dSYMs | Uploads if `upload-symbols` and `GoogleService-Info.plist` are found |
 
@@ -162,22 +155,6 @@ SomeFolder/
 | `APP_STORE_CONNECT_ISSUER_ID` | App Store Connect Issuer ID |
 
 > If all apps share the same Apple Developer account, these 3 can also be moved to org-level secrets.
->
-> CI does not need separate workflow inputs for bundle ID or team ID. Those must come from the app repo's xcconfig-driven release configuration.
-
-### GitHub Actions variables for CI-generated release config
-
-If you do not want release identifiers committed to the repo, store them as GitHub Actions configuration variables and let `scripts/prepare.sh` generate the release xcconfig from them.
-
-Standard variable names exposed by `ios-ci` to `scripts/prepare.sh`:
-
-| Variable | Purpose |
-|---|---|
-| `IOS_RELEASE_TEAM_ID` | Apple team ID for Release / TestFlight builds |
-| `IOS_RELEASE_APP_BUNDLE_ID` | Main app bundle ID for Release / TestFlight builds |
-| `IOS_RELEASE_EXTENSION_BUNDLE_ID` | Optional extension bundle ID |
-
-For apps with more identifiers than these defaults cover, keep using `scripts/prepare.sh` and extend it with app-specific variables.
 
 ## Optional inputs
 
@@ -190,10 +167,18 @@ The caller workflow can override these defaults:
 | `ruby_version` | `3.2` | Ruby version for fastlane |
 | `scheme` | auto-detect | Required when the repo has multiple app schemes; for Flutter this is also used as the `--flavor` value |
 | `configuration` | `Release` | Xcode configuration used for validation, detection, and native builds. Flutter currently supports only `Release`. |
+| `release_identity_mode` | `managed` | `managed` patches the project in CI from GitHub variables. `xcconfig` expects the app repo to provide release identity itself. |
 
 ## Prepare script
 
-If your app needs custom steps before the build, create `scripts/prepare.sh` in your app repo. This is the right place to generate CI-only release xcconfig files from GitHub variables, copy release secrets into config files, or run code generators before CI validates the project contract.
+`scripts/prepare.sh` is optional. In the default `managed` mode, you do not need it just to provide team ID and bundle ID.
+
+Create `scripts/prepare.sh` only when the app needs custom pre-build steps such as:
+
+- code generation
+- copying config files
+- running repo-specific setup before CocoaPods or Xcode detection
+- generating xcconfig files for the advanced `xcconfig` mode
 
 Example:
 
@@ -201,12 +186,8 @@ Example:
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate a CI-only release xcconfig from GitHub Actions variables
-cat > Config/CI.Release.generated.xcconfig <<EOF
-APPLE_TEAM_ID = ${IOS_RELEASE_TEAM_ID}
-APP_BUNDLE_ID = ${IOS_RELEASE_APP_BUNDLE_ID}
-APP_EXTENSION_BUNDLE_ID = ${IOS_RELEASE_EXTENSION_BUNDLE_ID}
-EOF
+# Example: repo-specific prebuild setup
+swift package plugin generate-code
 ```
 
 ## Files in this repo
@@ -222,6 +203,7 @@ ios-ci/
 ├── Gemfile                         # fastlane dependency
 └── scripts/
     ├── detect-project.sh           # Auto-detects workspace, scheme, targets, bundle IDs
+    ├── manage-release-identity.rb  # Patches Release identity in CI with xcodeproj
     ├── validate-project-contract.rb # Enforces the xcconfig-driven release contract
     └── generate-export-options.sh  # Builds ExportOptions.plist dynamically
 ```
