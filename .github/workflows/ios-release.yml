@@ -140,6 +140,32 @@ jobs:
               ;;
           esac
 
+      - name: Resolve release version metadata
+        id: version_meta
+        run: |
+          TAG=""
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME:-}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            VERSION="${TAG#v}"
+            if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "ERROR: Release tags must look like v1.2.3 or 1.2.3. Got '$TAG'." >&2
+              exit 1
+            fi
+            echo "marketing_version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo ":: Release tag '$TAG' -> MARKETING_VERSION=$VERSION"
+          else
+            echo "marketing_version=" >> "$GITHUB_OUTPUT"
+            echo ":: No release tag detected. Keeping the project's existing marketing version."
+          fi
+
+          echo "build_number=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo ":: CURRENT_PROJECT_VERSION=${GITHUB_RUN_NUMBER}"
+
       # ── Run app-specific prepare script (if exists) ──
       # Must run BEFORE detect — some projects generate xcconfigs
       # that xcodebuild needs to resolve bundle IDs and team ID.
@@ -174,6 +200,18 @@ jobs:
       - name: Pre-detect Xcode project
         id: detect_pre
         run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}" prepatch
+
+      - name: Stamp build version
+        working-directory: _ci
+        env:
+          IOS_RELEASE_MARKETING_VERSION: ${{ steps.version_meta.outputs.marketing_version }}
+          IOS_RELEASE_BUILD_NUMBER: ${{ steps.version_meta.outputs.build_number }}
+        run: |
+          bundle exec ruby scripts/stamp-build-version.rb \
+            "$GITHUB_WORKSPACE" \
+            "${{ steps.detect_pre.outputs.project }}" \
+            "${{ steps.detect_pre.outputs.configuration }}" \
+            '${{ steps.detect_pre.outputs.targets_json }}'
 
       - name: Apply CI-managed release identity
         if: inputs.release_identity_mode == 'managed'
@@ -280,7 +318,10 @@ jobs:
       - name: Build app-store IPA
         run: |
           if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
-            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AppStore.plist)
+            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AppStore.plist --build-number "${{ steps.version_meta.outputs.build_number }}")
+            if [ -n "${{ steps.version_meta.outputs.marketing_version }}" ]; then
+              FLUTTER_ARGS+=(--build-name "${{ steps.version_meta.outputs.marketing_version }}")
+            fi
             if [ "${{ steps.detect.outputs.scheme }}" != "Runner" ]; then
               FLUTTER_ARGS+=(--flavor "${{ steps.detect.outputs.scheme }}")
             fi
@@ -371,7 +412,10 @@ jobs:
         if: inputs.adhoc
         run: |
           if [ "${{ steps.detect.outputs.is_flutter }}" = "true" ]; then
-            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AdHoc.plist)
+            FLUTTER_ARGS=(build ipa --release --export-options-plist build/export-options/AdHoc.plist --build-number "${{ steps.version_meta.outputs.build_number }}")
+            if [ -n "${{ steps.version_meta.outputs.marketing_version }}" ]; then
+              FLUTTER_ARGS+=(--build-name "${{ steps.version_meta.outputs.marketing_version }}")
+            fi
             if [ "${{ steps.detect.outputs.scheme }}" != "Runner" ]; then
               FLUTTER_ARGS+=(--flavor "${{ steps.detect.outputs.scheme }}")
             fi

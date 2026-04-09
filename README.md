@@ -19,14 +19,16 @@ When a GitHub Release is created in any app repo, the thin caller workflow invok
 1. Checks out the app repo and this `ios-ci` repo
 2. Runs `scripts/prepare.sh` if it exists in the app repo
 3. Locates the Xcode project structure and installs CocoaPods dependencies if a `Podfile` is present
-4. Detects whether it's a Flutter or native project
-5. Pre-detects the workspace, scheme, and signable targets from the delivered project
-6. In the default `managed` mode, patches the chosen configuration in CI with your release team ID and bundle IDs
-7. Re-detects the final bundle IDs and team ID after patching
-8. Generates `ExportOptions.plist` dynamically from detected bundle IDs
-9. Signs all targets via fastlane match
-10. Builds the IPA and uploads to TestFlight
-11. Optionally builds an ad-hoc IPA and uploads to Diawi
+4. Resolves the app version from the Git tag and the build number from `GITHUB_RUN_NUMBER`
+5. Detects whether it's a Flutter or native project
+6. Pre-detects the workspace, scheme, and signable targets from the delivered project
+7. Stamps the chosen configuration with the resolved version/build number
+8. In the default `managed` mode, patches the chosen configuration in CI with your release team ID and bundle IDs
+9. Re-detects the final bundle IDs and team ID after patching
+10. Generates `ExportOptions.plist` dynamically from detected bundle IDs
+11. Signs all targets via fastlane match
+12. Builds the IPA and uploads to TestFlight
+13. Optionally builds an ad-hoc IPA and uploads to Diawi
 
 ## Default consumer contract
 
@@ -43,6 +45,22 @@ In this default `managed` mode, `ios-ci` uses `xcodeproj` in CI to patch the sel
 - extension bundle IDs are derived automatically when they share the main app bundle prefix
 
 This means the delivered Xcode project can stay mostly as-is for CI release automation.
+
+## Versioning
+
+By default, `ios-ci` uses:
+
+- app version (`MARKETING_VERSION`) = Git tag version
+- build number (`CURRENT_PROJECT_VERSION`) = `GITHUB_RUN_NUMBER`
+
+Supported tag formats:
+
+- `v1.2.3`
+- `1.2.3`
+
+On release/tag builds, `ios-ci` strips a leading `v` and stamps the app to that version in CI before building.
+
+On manual runs without a tag, `ios-ci` keeps the app's existing marketing version and only auto-increments the build number.
 
 ### Required repo variables
 
@@ -103,6 +121,7 @@ The workflow automatically discovers:
 | Scheme | `xcodebuild -list`, filters out Pods/Tests/Widget schemes |
 | Targets + bundle IDs | `xcodebuild -showBuildSettings` for the selected scheme/configuration |
 | Release identity in default mode | Patched in CI with `xcodeproj` before the final detection pass |
+| Versioning | Tag version -> `MARKETING_VERSION`, `GITHUB_RUN_NUMBER` -> `CURRENT_PROJECT_VERSION` |
 | Team ID | From the final detected `DEVELOPMENT_TEAM` build setting after patching |
 | CocoaPods | Runs `pod install` before validation if a Podfile exists |
 | Crashlytics dSYMs | Uploads if `upload-symbols` and `GoogleService-Info.plist` are found |
@@ -204,6 +223,7 @@ ios-ci/
 └── scripts/
     ├── detect-project.sh           # Auto-detects workspace, scheme, targets, bundle IDs
     ├── manage-release-identity.rb  # Patches Release identity in CI with xcodeproj
+    ├── stamp-build-version.rb      # Stamps app version/build number in CI with xcodeproj
     ├── validate-project-contract.rb # Enforces the xcconfig-driven release contract
     └── generate-export-options.sh  # Builds ExportOptions.plist dynamically
 ```
