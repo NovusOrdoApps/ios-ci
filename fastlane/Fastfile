@@ -154,6 +154,7 @@ platform :ios do
     else
       deliver_opts[:skip_screenshots] = false
       deliver_opts[:screenshots_path] = options[:screenshots_path]
+      deliver_opts[:overwrite_screenshots] = true
     end
 
     deliver(deliver_opts)

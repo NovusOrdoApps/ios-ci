@@ -94,15 +94,18 @@ def process_screenshots(screenshots_dir, output_dir)
 
     FileUtils.cp(s[:source], out_path)
 
-    # Strip alpha channel via TIFF roundtrip (lossless; sips -s hasAlpha false does not work on PNGs)
-    tiff_tmp = out_path.sub(/\.png$/i, ".tiff")
-    unless system("sips", "-s", "format", "tiff", "-s", "formatOptions", "lzw", out_path, "--out", tiff_tmp, out: File::NULL, err: File::NULL)
-      abort("ERROR: Failed to convert #{out_name} to TIFF for alpha removal.")
+    # Strip alpha channel via JPEG roundtrip at max quality.
+    # sips -s hasAlpha false does not work on PNGs, and TIFF roundtrip preserves alpha.
+    # JPEG at quality 100 is visually lossless for App Store screenshots — same approach
+    # used by fastlane's frameit and other ecosystem tools.
+    jpeg_tmp = out_path.sub(/\.png$/i, ".jpg")
+    unless system("sips", "-s", "format", "jpeg", "-s", "formatOptions", "100", out_path, "--out", jpeg_tmp, out: File::NULL, err: File::NULL)
+      abort("ERROR: Failed to convert #{out_name} to JPEG for alpha removal.")
     end
-    unless system("sips", "-s", "format", "png", tiff_tmp, "--out", out_path, out: File::NULL, err: File::NULL)
+    unless system("sips", "-s", "format", "png", jpeg_tmp, "--out", out_path, out: File::NULL, err: File::NULL)
       abort("ERROR: Failed to convert #{out_name} back to PNG after alpha removal.")
     end
-    FileUtils.rm_f(tiff_tmp)
+    FileUtils.rm_f(jpeg_tmp)
 
     # Scale to exact Apple dimensions
     unless system("sips", "-z", s[:target_h].to_s, s[:target_w].to_s, out_path, out: File::NULL, err: File::NULL)

@@ -22,6 +22,7 @@ def parse_jsonc(path)
   return {} unless File.file?(path)
 
   raw = File.read(path)
+  raw = raw.delete_prefix("\xEF\xBB\xBF") # Strip UTF-8 BOM (common with Windows editors)
   return {} if raw.strip.empty?
 
   lines = raw.lines.map do |line|
