@@ -451,6 +451,7 @@ jobs:
         env:
           DIAWI_TOKEN: ${{ secrets.DIAWI_TOKEN }}
           TG_WORKER_API_KEY: ${{ secrets.TG_WORKER_API_KEY }}
+          TG_WORKER_URL: ${{ secrets.TG_WORKER_URL }}
         run: |
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
@@ -490,7 +491,7 @@ jobs:
                 REPO_NAME="${{ github.event.repository.name }}"
                 MSG="${REPO_NAME} build available!\n\n${RELEASE_NAME}\nVersion: ${TAG}\n\nInstall: ${LINK}"
                 curl -s -X POST \
-                  "https://support-email-to-telegram.novusordovpn.workers.dev/" \
+                  "$TG_WORKER_URL" \
                   -H "Content-Type: application/json" \
                   -H "X-API-Key: $TG_WORKER_API_KEY" \
                   -d "{\"message\": \"$MSG\"}"

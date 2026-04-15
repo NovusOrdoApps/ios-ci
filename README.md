@@ -1,6 +1,6 @@
 # ios-ci
 
-Shared iOS CI/CD infrastructure for NovusOrdo app repositories. App repos keep a tiny caller workflow, while this repo handles signing, building, TestFlight upload, and optional ad-hoc distribution.
+Shared iOS CI/CD infrastructure for your app repositories. App repos keep a tiny caller workflow, while this repo handles signing, building, TestFlight upload, and optional ad-hoc distribution.
 
 By default, app repos do not need release xcconfig wiring. `ios-ci` patches the chosen Xcode configuration inside the GitHub Actions runner so CI can publish using your organization-owned team and bundle IDs without changing the delivered project by hand.
 
@@ -81,7 +81,7 @@ Most apps do not need these. They are only for projects whose secondary targets 
 Example:
 
 ```json
-{"WidgetExtension":"com.novusordo.myapp.widget","NotificationService":"com.novusordo.myapp.notification-service"}
+{"WidgetExtension":"com.example.myapp.widget","NotificationService":"com.example.myapp.notification-service"}
 ```
 
 If a secondary target's delivered bundle ID does not share the main app prefix, `ios-ci` fails early and tells you to use one of these overrides or the advanced xcconfig mode below.
@@ -154,7 +154,7 @@ SomeFolder/
 
 ## Secrets
 
-### Organization secrets (set once in NovusOrdoApps org settings)
+### Organization secrets (set once in your GitHub org settings)
 
 | Secret | Purpose |
 |---|---|
@@ -164,6 +164,7 @@ SomeFolder/
 | `MATCH_GIT_PAT` | PAT with read/write access to the certificate repo |
 | `DIAWI_TOKEN` | Diawi API token (only needed for ad-hoc builds) |
 | `TG_WORKER_API_KEY` | Telegram notification worker API key (only needed for ad-hoc builds) |
+| `TG_WORKER_URL` | Telegram notification worker URL (only needed for ad-hoc builds) |
 
 ### Per-repo secrets (set in each app repo)
 
@@ -288,7 +289,7 @@ on:
 
 jobs:
   metadata:
-    uses: NovusOrdoApps/ios-ci/.github/workflows/ios-metadata.yml@main
+    uses: your-org/ios-ci/.github/workflows/ios-metadata.yml@main
     with:
       app_version: ${{ inputs.app_version }}
       skip_screenshots: ${{ inputs.skip_screenshots }}
@@ -325,5 +326,5 @@ ios-ci/
 Changes to this repo take effect immediately for all app repos if they reference `@main`. To pin a stable version, change the caller to reference a tag:
 
 ```yaml
-uses: NovusOrdoApps/ios-ci/.github/workflows/ios-release.yml@v1
+uses: your-org/ios-ci/.github/workflows/ios-release.yml@v1
 ```
