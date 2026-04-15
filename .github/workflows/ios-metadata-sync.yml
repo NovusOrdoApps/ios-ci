@@ -1,0 +1,134 @@
+# Reusable workflow: Pull metadata from App Store Connect and open a PR.
+#
+# Downloads current metadata from ASC, converts it to the custom
+# translator-friendly format, and opens a pull request with the result.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS Metadata Sync (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+
+concurrency:
+  group: ios-metadata-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-metadata:
+    name: Sync Metadata from App Store Connect
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+
+      - name: Download metadata from App Store Connect
+        working-directory: _ci
+        run: |
+          bundle exec fastlane fetch_metadata \
+            output_path:"$RUNNER_TEMP/asc-download"
+
+      - name: Reverse transform to custom format
+        run: |
+          # Clear existing metadata text (keep Screenshots if any)
+          if [ -d "metadata/Text" ]; then
+            rm -rf metadata/Text
+          fi
+
+          ruby _ci/scripts/reverse_transform_metadata.rb \
+            --input "$RUNNER_TEMP/asc-download/metadata" \
+            --output "metadata/Text"
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git add metadata/Text/
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo ":: No changes detected — repo is already in sync."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo ":: Changes detected, will open PR."
+          fi
+
+      - name: Create PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CHECKOUT_PAT }}
+        run: |
+          BRANCH="metadata-sync/$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git commit -m "sync: pull metadata from App Store Connect"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "Sync metadata from App Store Connect" \
+            --body "$(cat <<'BODY'
+          ## Summary
+
+          Pulled current metadata from App Store Connect and converted to the repo convention.
+
+          - Shared values (identical across all locales) are in `defaults/`
+          - Per-locale overrides are in their respective locale folders
+          - Only fields that differ from defaults are stored per-locale
+
+          **Review the changes and merge when ready.**
+          BODY
+          )"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"

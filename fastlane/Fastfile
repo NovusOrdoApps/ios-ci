@@ -159,6 +159,34 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # fetch_metadata
+  #
+  # Downloads metadata from App Store Connect into deliver's format.
+  # Usage: bundle exec fastlane fetch_metadata output_path:/tmp/asc-metadata
+  # ──────────────────────────────────────────────
+  lane :fetch_metadata do |options|
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    output_path = options[:output_path] || "."
+
+    deliver(
+      api_key: api_key,
+      app_identifier: ENV.fetch("APP_BUNDLE_ID"),
+      run_precheck_before_submit: false,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      force: true,
+      download_metadata: true,
+      metadata_path: File.join(output_path, "metadata"),
+      skip_metadata: false,
+    )
+  end
+
+  # ──────────────────────────────────────────────
   # update_metadata
   #
   # Uploads metadata and/or screenshots to App Store Connect.
