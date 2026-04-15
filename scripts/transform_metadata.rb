@@ -83,6 +83,9 @@ def parse_cli_args(argv)
     when "--output"
       args[:output] = argv[i + 1]
       i += 2
+    when "--locales"
+      args[:locales] = argv[i + 1]
+      i += 2
     when "--use-default-whats-new"
       args[:use_default_whats_new] = argv[i + 1] == "true"
       i += 2
@@ -119,12 +122,20 @@ end
 
 defaults_dir = File.join(text_dir, "defaults")
 
-locale_dirs = Dir.children(text_dir)
-  .select { |entry| File.directory?(File.join(text_dir, entry)) && entry != "defaults" }
-  .sort
+# Determine target locales: from --locales flag (ASC query) or from filesystem
+if args[:locales] && !args[:locales].empty?
+  locales = args[:locales].split(",").map(&:strip).reject(&:empty?).sort
+  puts(":: Using #{locales.size} locale(s) from App Store Connect: #{locales.join(', ')}")
+else
+  # Fallback: discover from filesystem (locale folders under Text/)
+  locales = Dir.children(text_dir)
+    .select { |entry| File.directory?(File.join(text_dir, entry)) && entry != "defaults" }
+    .sort
 
-if locale_dirs.empty?
-  fail_with(["No locale directories found under '#{text_dir}'. Expected at least one locale (e.g., en, ru)."])
+  if locales.empty?
+    fail_with(["No locales available. Pass --locales or create locale directories under '#{text_dir}'."])
+  end
+  puts(":: Using #{locales.size} locale(s) from filesystem: #{locales.join(', ')}")
 end
 
 defaults_info = parse_jsonc(File.join(defaults_dir, "info.jsonc"))
@@ -137,39 +148,55 @@ end
 
 metadata_output = File.join(output_dir, "metadata")
 
-locale_dirs.each do |locale|
+locales.each do |locale|
   locale_path = File.join(text_dir, locale)
+  has_locale_dir = File.directory?(locale_path)
   deliver_locale_dir = File.join(metadata_output, locale)
-  FileUtils.mkdir_p(deliver_locale_dir)
 
-  locale_info = parse_jsonc(File.join(locale_path, "info.jsonc"))
+  # Merge info: defaults + locale overrides (if locale dir exists)
+  locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
   merged_info = defaults_info.merge(locale_info)
 
+  # Only write fields that have non-empty values
+  fields_written = 0
   JSONC_FIELD_MAP.each do |json_key, deliver_filename|
     value = merged_info[json_key]
-    next unless value
+    next if value.nil? || value.to_s.strip.empty?
 
+    FileUtils.mkdir_p(deliver_locale_dir)
     File.write(File.join(deliver_locale_dir, deliver_filename), value)
+    fields_written += 1
   end
 
-  locale_description = read_text_file(File.join(locale_path, "description.txt"))
+  # description: locale overrides defaults
+  locale_description = has_locale_dir ? read_text_file(File.join(locale_path, "description.txt")) : nil
   description = locale_description || defaults_description
-  if description
+  if description && !description.strip.empty?
+    FileUtils.mkdir_p(deliver_locale_dir)
     File.write(File.join(deliver_locale_dir, "description.txt"), description)
+    fields_written += 1
   end
 
+  # whatsNew → release_notes.txt
   if use_default_whats_new
     whats_new = defaults_whats_new
   else
-    locale_whats_new = read_text_file(File.join(locale_path, "whatsNew.txt"))
+    locale_whats_new = has_locale_dir ? read_text_file(File.join(locale_path, "whatsNew.txt")) : nil
     whats_new = locale_whats_new || defaults_whats_new
   end
 
-  if whats_new
+  if whats_new && !whats_new.strip.empty?
+    FileUtils.mkdir_p(deliver_locale_dir)
     File.write(File.join(deliver_locale_dir, "release_notes.txt"), whats_new)
+    fields_written += 1
   end
 
-  puts(":: Processed locale '#{locale}'")
+  source = has_locale_dir ? "locale + defaults" : "defaults only"
+  if fields_written > 0
+    puts(":: #{locale}: #{fields_written} field(s) written (#{source})")
+  else
+    puts(":: #{locale}: skipped (no data)")
+  end
 end
 
 unless skip_screenshots
@@ -185,4 +212,4 @@ unless skip_screenshots
   end
 end
 
-puts(":: Transform complete — #{locale_dirs.length} locale(s) processed")
+puts(":: Transform complete — #{locales.length} locale(s) processed")

@@ -122,6 +122,43 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # fetch_locales
+  #
+  # Queries App Store Connect for the app's active locales.
+  # Writes a comma-separated list to GITHUB_OUTPUT or prints to stdout.
+  # Usage: bundle exec fastlane fetch_locales
+  # ──────────────────────────────────────────────
+  lane :fetch_locales do
+    require "spaceship"
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    # Get the latest editable or live version to read its locales
+    version = app.get_edit_app_store_version || app.get_live_app_store_version
+    UI.user_error!("No app version found on App Store Connect.") unless version
+
+    localizations = version.get_app_store_version_localizations
+    locales = localizations.map(&:locale).sort
+
+    UI.message(":: Found #{locales.size} locale(s): #{locales.join(', ')}")
+
+    # Write to GITHUB_OUTPUT if available, otherwise print
+    output_file = ENV["GITHUB_OUTPUT"]
+    if output_file
+      File.open(output_file, "a") { |f| f.puts("locales=#{locales.join(',')}") }
+    else
+      puts "LOCALES=#{locales.join(',')}"
+    end
+  end
+
+  # ──────────────────────────────────────────────
   # update_metadata
   #
   # Uploads metadata and/or screenshots to App Store Connect.

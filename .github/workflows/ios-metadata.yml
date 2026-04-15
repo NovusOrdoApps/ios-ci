@@ -101,11 +101,17 @@ jobs:
           echo ":: Skip Screenshots: ${{ inputs.skip_screenshots }}"
           echo ":: Use Default What's New: ${{ inputs.use_default_whats_new }}"
 
+      - name: Fetch active locales from App Store Connect
+        id: locales
+        working-directory: _ci
+        run: bundle exec fastlane fetch_locales
+
       - name: Transform metadata
         run: |
           ruby _ci/scripts/transform_metadata.rb \
             --input "$GITHUB_WORKSPACE/metadata" \
             --output "$RUNNER_TEMP/deliver-metadata" \
+            --locales "${{ steps.locales.outputs.locales }}" \
             --use-default-whats-new "${{ inputs.use_default_whats_new }}" \
             --skip-screenshots "${{ inputs.skip_screenshots }}"
 
