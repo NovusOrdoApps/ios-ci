@@ -1,0 +1,6 @@
+{
+  // Shared across all locales
+  "marketingUrl": "https://example.com",
+  "supportUrl": "https://example.com/support",
+  "privacyUrl": "https://example.com/privacy"
+}

@@ -1,0 +1,8 @@
+My Cool App is the best app you'll ever use.
+
+Features:
+- Feature one
+- Feature two
+- Feature three
+
+Download now!
