@@ -103,7 +103,7 @@ jobs:
 
       - name: Transform metadata
         run: |
-          ruby _ci/scripts/transform-metadata.rb \
+          ruby _ci/scripts/transform_metadata.rb \
             --input "$GITHUB_WORKSPACE/metadata" \
             --output "$RUNNER_TEMP/deliver-metadata" \
             --use-default-whats-new "${{ inputs.use_default_whats_new }}" \

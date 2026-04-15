@@ -1,4 +1,5 @@
 require "fileutils"
+require "open3"
 
 DEVICE_DIMENSIONS = {
   "APP_IPHONE_67" => [1290, 2796],
@@ -11,10 +12,10 @@ DEVICE_DIMENSIONS = {
 DIMENSION_TOLERANCE = 20
 
 def sips_dimensions(path)
-  output = `sips -g pixelWidth -g pixelHeight "#{path}" 2>/dev/null`
-  width = output[/pixelWidth:\s*(\d+)/, 1].to_i
-  height = output[/pixelHeight:\s*(\d+)/, 1].to_i
-  [width, height]
+  output, _ = Open3.capture2("sips", "-g", "pixelWidth", "-g", "pixelHeight", path)
+  width = output[/pixelWidth:\s*(\d+)/, 1]&.to_i
+  height = output[/pixelHeight:\s*(\d+)/, 1]&.to_i
+  [width || 0, height || 0]
 end
 
 def process_screenshots(screenshots_dir, output_dir)
@@ -36,6 +37,12 @@ def process_screenshots(screenshots_dir, output_dir)
     end
 
     actual_w, actual_h = sips_dimensions(png_path)
+
+    if actual_w == 0 || actual_h == 0
+      errors << { path: relative, message: "Failed to read image dimensions — file may be corrupted or not a valid PNG." }
+      next
+    end
+
     landscape = actual_w > actual_h
 
     target_w, target_h = target
@@ -87,15 +94,15 @@ def process_screenshots(screenshots_dir, output_dir)
 
     FileUtils.cp(s[:source], out_path)
 
-    # Strip alpha channel via JPEG roundtrip (sips -s hasAlpha false does not work)
-    jpeg_tmp = out_path.sub(/\.png$/i, ".jpg")
-    unless system("sips", "-s", "format", "jpeg", out_path, "--out", jpeg_tmp, out: File::NULL, err: File::NULL)
-      abort("ERROR: Failed to convert #{out_name} to JPEG for alpha removal.")
+    # Strip alpha channel via TIFF roundtrip (lossless; sips -s hasAlpha false does not work on PNGs)
+    tiff_tmp = out_path.sub(/\.png$/i, ".tiff")
+    unless system("sips", "-s", "format", "tiff", "-s", "formatOptions", "lzw", out_path, "--out", tiff_tmp, out: File::NULL, err: File::NULL)
+      abort("ERROR: Failed to convert #{out_name} to TIFF for alpha removal.")
     end
-    unless system("sips", "-s", "format", "png", jpeg_tmp, "--out", out_path, out: File::NULL, err: File::NULL)
+    unless system("sips", "-s", "format", "png", tiff_tmp, "--out", out_path, out: File::NULL, err: File::NULL)
       abort("ERROR: Failed to convert #{out_name} back to PNG after alpha removal.")
     end
-    FileUtils.rm_f(jpeg_tmp)
+    FileUtils.rm_f(tiff_tmp)
 
     # Scale to exact Apple dimensions
     unless system("sips", "-z", s[:target_h].to_s, s[:target_w].to_s, out_path, out: File::NULL, err: File::NULL)

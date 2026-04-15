@@ -22,6 +22,8 @@ def parse_jsonc(path)
   return {} unless File.file?(path)
 
   raw = File.read(path)
+  return {} if raw.strip.empty?
+
   lines = raw.lines.map do |line|
     # Remove full-line comments (optional leading whitespace + //)
     next "" if line.match?(/\A\s*\/\//)
@@ -36,7 +38,7 @@ def parse_jsonc(path)
         escape = false
         next
       end
-      if char == '\\'
+      if in_string && char == '\\'
         escape = true
         next
       end
@@ -54,6 +56,10 @@ def parse_jsonc(path)
     comment_start ? line[0...comment_start].rstrip + "\n" : line
   end
   stripped = lines.join
+
+  # Strip trailing commas (common JSONC pattern, invalid in strict JSON)
+  stripped = stripped.gsub(/,\s*([}\]])/, '\1')
+
   JSON.parse(stripped)
 rescue JSON::ParserError => e
   fail_with(["Failed to parse JSONC file '#{path}': #{e.message}"])
@@ -167,11 +173,14 @@ end
 
 unless skip_screenshots
   screenshots_dir = File.join(input_dir, "Screenshots")
+  screenshots_output = File.join(output_dir, "screenshots")
   if File.directory?(screenshots_dir)
     require_relative "transform_screenshots"
-    process_screenshots(screenshots_dir, File.join(output_dir, "screenshots"))
+    process_screenshots(screenshots_dir, screenshots_output)
   else
-    puts(":: No Screenshots/ directory found, skipping screenshots.")
+    # Create empty dir so deliver gets a valid path (it handles empty dirs gracefully)
+    FileUtils.mkdir_p(screenshots_output)
+    puts(":: No Screenshots/ directory found, created empty screenshots output.")
   end
 end
 

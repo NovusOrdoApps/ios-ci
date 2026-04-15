@@ -316,7 +316,7 @@ ios-ci/
     ├── stamp-build-version.rb      # Stamps app version/build number in CI with xcodeproj
     ├── validate-project-contract.rb # Enforces the xcconfig-driven release contract
     ├── generate-export-options.sh  # Builds ExportOptions.plist dynamically
-    ├── transform-metadata.rb       # Transforms custom metadata format to deliver format
+    ├── transform_metadata.rb       # Transforms custom metadata format to deliver format
     └── transform_screenshots.rb    # Validates and processes screenshots for App Store
 ```
 
