@@ -138,9 +138,11 @@ if use_default_whats_new && defaults_whats_new.nil?
   fail_with(["--use-default-whats-new is true but defaults/whatsNew.txt does not exist at '#{defaults_dir}'."])
 end
 
+metadata_output = File.join(output_dir, "metadata")
+
 locale_dirs.each do |locale|
   locale_path = File.join(text_dir, locale)
-  deliver_locale_dir = File.join(output_dir, locale)
+  deliver_locale_dir = File.join(metadata_output, locale)
   FileUtils.mkdir_p(deliver_locale_dir)
 
   locale_info = parse_jsonc(File.join(locale_path, "info.jsonc"))
@@ -174,8 +176,13 @@ locale_dirs.each do |locale|
 end
 
 unless skip_screenshots
-  require_relative "transform_screenshots"
-  process_screenshots(input_dir: input_dir, output_dir: output_dir, locale_dirs: locale_dirs)
+  screenshots_dir = File.join(input_dir, "Screenshots")
+  if File.directory?(screenshots_dir)
+    require_relative "transform_screenshots"
+    process_screenshots(screenshots_dir, File.join(output_dir, "screenshots"))
+  else
+    puts(":: No Screenshots/ directory found, skipping screenshots.")
+  end
 end
 
 puts(":: Transform complete — #{locale_dirs.length} locale(s) processed")
