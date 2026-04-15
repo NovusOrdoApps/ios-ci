@@ -1,0 +1,123 @@
+# Reusable workflow: Update App Store metadata and screenshots.
+#
+# Transforms a custom translator-friendly folder convention into
+# fastlane deliver format and uploads to App Store Connect.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS Metadata (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_version:
+        description: "Target app version. Leave empty to update the current editable version."
+        required: false
+        type: string
+        default: ""
+      skip_screenshots:
+        description: "Skip screenshot upload"
+        required: false
+        type: boolean
+        default: true
+      use_default_whats_new:
+        description: "Use defaults/whatsNew.txt for all locales, ignoring per-locale whatsNew files"
+        required: false
+        type: boolean
+        default: true
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      macos_runner:
+        description: "macOS runner label (needed for sips screenshot processing)"
+        required: false
+        type: string
+        default: "macos-15"
+
+concurrency:
+  group: ios-metadata-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-metadata:
+    name: Update App Store Metadata
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 30
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout app/metadata repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+          token: ${{ secrets.CHECKOUT_PAT }}
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+
+          if [ ! -d "metadata/Text" ]; then
+            echo "ERROR: Expected metadata/Text/ directory at the repo root." >&2
+            echo "See ios-ci README for the expected metadata structure." >&2
+            exit 1
+          fi
+
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+          echo ":: App Version: ${{ inputs.app_version || '(current draft)' }}"
+          echo ":: Skip Screenshots: ${{ inputs.skip_screenshots }}"
+          echo ":: Use Default What's New: ${{ inputs.use_default_whats_new }}"
+
+      - name: Transform metadata
+        run: |
+          ruby _ci/scripts/transform-metadata.rb \
+            --input "$GITHUB_WORKSPACE/metadata" \
+            --output "$RUNNER_TEMP/deliver-metadata" \
+            --use-default-whats-new "${{ inputs.use_default_whats_new }}" \
+            --skip-screenshots "${{ inputs.skip_screenshots }}"
+
+      - name: Upload metadata to App Store Connect
+        working-directory: _ci
+        run: |
+          bundle exec fastlane update_metadata \
+            metadata_path:"$RUNNER_TEMP/deliver-metadata/metadata" \
+            screenshots_path:"$RUNNER_TEMP/deliver-metadata/screenshots" \
+            skip_screenshots:"${{ inputs.skip_screenshots }}" \
+            app_version:"${{ inputs.app_version }}"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"

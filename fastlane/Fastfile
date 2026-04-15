@@ -121,4 +121,42 @@ platform :ios do
     )
   end
 
+  # ──────────────────────────────────────────────
+  # update_metadata
+  #
+  # Uploads metadata and/or screenshots to App Store Connect.
+  # Usage: bundle exec fastlane update_metadata \
+  #          metadata_path:/tmp/deliver/metadata \
+  #          screenshots_path:/tmp/deliver/screenshots \
+  #          skip_screenshots:true \
+  #          app_version:2.5.0
+  # ──────────────────────────────────────────────
+  lane :update_metadata do |options|
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    deliver_opts = {
+      api_key: api_key,
+      app_identifier: ENV.fetch("APP_BUNDLE_ID"),
+      metadata_path: options[:metadata_path],
+      skip_binary_upload: true,
+      force: true,
+      precheck_include_in_app_purchases: false,
+    }
+
+    deliver_opts[:app_version] = options[:app_version] unless options[:app_version].to_s.empty?
+
+    if options[:skip_screenshots] == "true"
+      deliver_opts[:skip_screenshots] = true
+    else
+      deliver_opts[:skip_screenshots] = false
+      deliver_opts[:screenshots_path] = options[:screenshots_path]
+    end
+
+    deliver(deliver_opts)
+  end
+
 end
