@@ -6,9 +6,9 @@ DEVICE_DIMENSIONS = {
   "APP_IPHONE_55" => [1242, 2208],
   "APP_IPAD_129"  => [2048, 2732],
   "APP_IPAD_110"  => [1668, 2388]
-}.freeze unless defined?(DEVICE_DIMENSIONS)
+}.freeze
 
-DIMENSION_TOLERANCE = 20 unless defined?(DIMENSION_TOLERANCE)
+DIMENSION_TOLERANCE = 20
 
 def sips_dimensions(path)
   output = `sips -g pixelWidth -g pixelHeight "#{path}" 2>/dev/null`
@@ -87,8 +87,20 @@ def process_screenshots(screenshots_dir, output_dir)
 
     FileUtils.cp(s[:source], out_path)
 
-    system("sips", "-s", "hasAlpha", "false", out_path, out: File::NULL, err: File::NULL)
-    system("sips", "-z", s[:target_h].to_s, s[:target_w].to_s, out_path, out: File::NULL, err: File::NULL)
+    # Strip alpha channel via JPEG roundtrip (sips -s hasAlpha false does not work)
+    jpeg_tmp = out_path.sub(/\.png$/i, ".jpg")
+    unless system("sips", "-s", "format", "jpeg", out_path, "--out", jpeg_tmp, out: File::NULL, err: File::NULL)
+      abort("ERROR: Failed to convert #{out_name} to JPEG for alpha removal.")
+    end
+    unless system("sips", "-s", "format", "png", jpeg_tmp, "--out", out_path, out: File::NULL, err: File::NULL)
+      abort("ERROR: Failed to convert #{out_name} back to PNG after alpha removal.")
+    end
+    FileUtils.rm_f(jpeg_tmp)
+
+    # Scale to exact Apple dimensions
+    unless system("sips", "-z", s[:target_h].to_s, s[:target_w].to_s, out_path, out: File::NULL, err: File::NULL)
+      abort("ERROR: Failed to resize #{out_name} to #{s[:target_w]}x#{s[:target_h]}.")
+    end
 
     puts(":: Processed screenshot #{s[:locale]}/#{out_name}")
   end

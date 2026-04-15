@@ -209,14 +209,104 @@ set -euo pipefail
 swift package plugin generate-code
 ```
 
+## App Store Metadata
+
+A second reusable workflow uploads App Store metadata (descriptions, keywords, screenshots, etc.) via fastlane `deliver`. Completely independent from the release workflow — no Xcode project or signing needed.
+
+### Metadata folder convention
+
+The caller repo provides metadata in a translator-friendly format:
+
+```
+metadata/
+├── Text/
+│   ├── defaults/
+│   │   ├── info.jsonc          # Shared fields (URLs, etc.)
+│   │   ├── description.txt     # Optional base description
+│   │   └── whatsNew.txt        # Shared release notes
+│   ├── en/
+│   │   ├── info.jsonc          # Locale-specific overrides
+│   │   ├── description.txt     # Plain text, real line breaks
+│   │   └── whatsNew.txt        # Optional localized release notes
+│   └── ru/
+│       └── ...
+└── Screenshots/
+    └── en/
+        ├── APP_IPHONE_67/      # 1290x2796
+        ├── APP_IPHONE_65/      # 1284x2778
+        ├── APP_IPHONE_55/      # 1242x2208
+        ├── APP_IPAD_129/       # 2048x2732
+        └── APP_IPAD_110/       # 1668x2388
+```
+
+**info.jsonc** supports comments and maps these fields to App Store Connect:
+
+| Key | ASC field |
+|---|---|
+| `name` | App name |
+| `subtitle` | Subtitle |
+| `keywords` | Keywords (comma-separated) |
+| `promotionalText` | Promotional text |
+| `marketingUrl` | Marketing URL |
+| `supportUrl` | Support URL |
+| `privacyUrl` | Privacy URL |
+
+**Merge logic:** `defaults/` provides base values; per-locale files override them. For `whatsNew`, the `use_default_whats_new` flag controls whether per-locale files are used or ignored (default: ignored — one shared release note for all locales).
+
+**Screenshots:** Must be PNG, within 20px of the target device dimensions. The workflow automatically scales to exact dimensions and strips the alpha channel.
+
+### Metadata workflow inputs
+
+| Input | Default | Description |
+|---|---|---|
+| `app_version` | `""` | Target app version. Empty = update current draft |
+| `skip_screenshots` | `true` | Skip screenshot upload |
+| `use_default_whats_new` | `true` | Use defaults/whatsNew.txt for all locales |
+
+### Metadata caller workflow
+
+```yaml
+name: Update App Store Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'Target app version (leave empty for current draft)'
+        required: false
+        default: ''
+      skip_screenshots:
+        description: 'Skip screenshot upload'
+        required: false
+        type: boolean
+        default: true
+      use_default_whats_new:
+        description: 'Use defaults/whatsNew.txt for all locales'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  metadata:
+    uses: NovusOrdoApps/ios-ci/.github/workflows/ios-metadata.yml@main
+    with:
+      app_version: ${{ inputs.app_version }}
+      skip_screenshots: ${{ inputs.skip_screenshots }}
+      use_default_whats_new: ${{ inputs.use_default_whats_new }}
+    secrets: inherit
+```
+
+Uses the same App Store Connect secrets as the release workflow. Also requires the `IOS_RELEASE_APP_BUNDLE_ID` variable.
+
 ## Files in this repo
 
 ```
 ios-ci/
 ├── .github/workflows/
-│   └── ios-release.yml             # Reusable workflow (all build logic)
+│   ├── ios-release.yml             # Reusable workflow (build + release)
+│   └── ios-metadata.yml            # Reusable workflow (metadata + screenshots)
 ├── fastlane/
-│   ├── Fastfile                    # Generic lanes: signing, building, uploading
+│   ├── Fastfile                    # Lanes: signing, building, uploading, metadata
 │   ├── Matchfile                   # Points to MATCH_GIT_URL from env
 │   └── Appfile                     # Empty (all values are dynamic)
 ├── Gemfile                         # fastlane dependency
@@ -225,7 +315,9 @@ ios-ci/
     ├── manage-release-identity.rb  # Patches Release identity in CI with xcodeproj
     ├── stamp-build-version.rb      # Stamps app version/build number in CI with xcodeproj
     ├── validate-project-contract.rb # Enforces the xcconfig-driven release contract
-    └── generate-export-options.sh  # Builds ExportOptions.plist dynamically
+    ├── generate-export-options.sh  # Builds ExportOptions.plist dynamically
+    ├── transform-metadata.rb       # Transforms custom metadata format to deliver format
+    └── transform_screenshots.rb    # Validates and processes screenshots for App Store
 ```
 
 ## Updating

@@ -13,16 +13,6 @@ JSONC_FIELD_MAP = {
   "privacyUrl" => "privacy_url.txt"
 }.freeze
 
-DEVICE_DIMENSIONS = {
-  "APP_IPHONE_67" => [1290, 2796],
-  "APP_IPHONE_65" => [1284, 2778],
-  "APP_IPHONE_55" => [1242, 2208],
-  "APP_IPAD_129" => [2048, 2732],
-  "APP_IPAD_110" => [1668, 2388]
-}.freeze
-
-DIMENSION_TOLERANCE = 20
-
 def fail_with(errors)
   errors.each { |error| warn("ERROR: #{error}") }
   exit(1)
