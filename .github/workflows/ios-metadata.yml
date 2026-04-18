@@ -29,8 +29,8 @@ on:
         required: false
         type: boolean
         default: true
-      use_default_whats_new:
-        description: "Use defaults/whatsNew.txt for all locales, ignoring per-locale whatsNew files"
+      update_whatsnew_only:
+        description: "Only update release notes (What's New). All other metadata is left untouched on App Store Connect."
         required: false
         type: boolean
         default: true
@@ -98,7 +98,7 @@ jobs:
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
           echo ":: App Version: ${{ inputs.app_version || '(current draft)' }}"
           echo ":: Skip Screenshots: ${{ inputs.skip_screenshots }}"
-          echo ":: Use Default What's New: ${{ inputs.use_default_whats_new }}"
+          echo ":: Update WhatsNew Only: ${{ inputs.update_whatsnew_only }}"
 
       - name: Fetch active locales from App Store Connect
         id: locales
@@ -111,7 +111,7 @@ jobs:
             --input "$GITHUB_WORKSPACE/metadata" \
             --output "$RUNNER_TEMP/deliver-metadata" \
             --locales "${{ steps.locales.outputs.locales }}" \
-            --use-default-whats-new "${{ inputs.use_default_whats_new }}" \
+            --update-whatsnew-only "${{ inputs.update_whatsnew_only }}" \
             --skip-screenshots "${{ inputs.skip_screenshots }}"
 
       - name: Upload metadata to App Store Connect

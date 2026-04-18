@@ -86,8 +86,8 @@ def parse_cli_args(argv)
     when "--locales"
       args[:locales] = argv[i + 1]
       i += 2
-    when "--use-default-whats-new"
-      args[:use_default_whats_new] = argv[i + 1] == "true"
+    when "--update-whatsnew-only"
+      args[:update_whatsnew_only] = argv[i + 1] == "true"
       i += 2
     when "--skip-screenshots"
       args[:skip_screenshots] = argv[i + 1] == "true"
@@ -102,7 +102,7 @@ def parse_cli_args(argv)
   errors << "--output is required" unless args[:output]
   fail_with(errors) unless errors.empty?
 
-  args[:use_default_whats_new] = true if args[:use_default_whats_new].nil?
+  args[:update_whatsnew_only] = true if args[:update_whatsnew_only].nil?
   args[:skip_screenshots] = true if args[:skip_screenshots].nil?
 
   args
@@ -112,7 +112,7 @@ args = parse_cli_args(ARGV)
 
 input_dir = File.expand_path(args[:input])
 output_dir = File.expand_path(args[:output])
-use_default_whats_new = args[:use_default_whats_new]
+update_whatsnew_only = args[:update_whatsnew_only]
 skip_screenshots = args[:skip_screenshots]
 
 text_dir = File.join(input_dir, "Text")
@@ -142,53 +142,53 @@ defaults_info = parse_jsonc(File.join(defaults_dir, "info.jsonc"))
 defaults_description = read_text_file(File.join(defaults_dir, "description.txt"))
 defaults_whats_new = read_text_file(File.join(defaults_dir, "whatsNew.txt"))
 
-if use_default_whats_new && defaults_whats_new.nil?
-  fail_with(["--use-default-whats-new is true but defaults/whatsNew.txt does not exist at '#{defaults_dir}'."])
-end
-
 metadata_output = File.join(output_dir, "metadata")
+
+if update_whatsnew_only
+  puts(":: Mode: whatsNew-only (no other metadata fields will be uploaded)")
+else
+  puts(":: Mode: full metadata (all fields from defaults + locale will be uploaded)")
+end
 
 locales.each do |locale|
   locale_path = File.join(text_dir, locale)
   has_locale_dir = File.directory?(locale_path)
   deliver_locale_dir = File.join(metadata_output, locale)
 
-  # Merge info: defaults + locale overrides (if locale dir exists)
-  locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
-  merged_info = defaults_info.merge(locale_info)
-
-  # Only write fields that have non-empty values
   fields_written = 0
-  JSONC_FIELD_MAP.each do |json_key, deliver_filename|
-    value = merged_info[json_key]
-    next if value.nil? || value.to_s.strip.empty?
 
-    FileUtils.mkdir_p(deliver_locale_dir)
-    File.write(File.join(deliver_locale_dir, deliver_filename), value)
-    fields_written += 1
-  end
-
-  # description: locale overrides defaults
-  locale_description = has_locale_dir ? read_text_file(File.join(locale_path, "description.txt")) : nil
-  description = locale_description || defaults_description
-  if description && !description.strip.empty?
-    FileUtils.mkdir_p(deliver_locale_dir)
-    File.write(File.join(deliver_locale_dir, "description.txt"), description)
-    fields_written += 1
-  end
-
-  # whatsNew → release_notes.txt
-  if use_default_whats_new
-    whats_new = defaults_whats_new
-  else
-    locale_whats_new = has_locale_dir ? read_text_file(File.join(locale_path, "whatsNew.txt")) : nil
-    whats_new = locale_whats_new || defaults_whats_new
-  end
-
+  # whatsNew → release_notes.txt (locale overrides defaults)
+  locale_whats_new = has_locale_dir ? read_text_file(File.join(locale_path, "whatsNew.txt")) : nil
+  whats_new = locale_whats_new || defaults_whats_new
   if whats_new && !whats_new.strip.empty?
     FileUtils.mkdir_p(deliver_locale_dir)
     File.write(File.join(deliver_locale_dir, "release_notes.txt"), whats_new)
     fields_written += 1
+  end
+
+  unless update_whatsnew_only
+    # Merge info: defaults + locale overrides (if locale dir exists)
+    locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
+    merged_info = defaults_info.merge(locale_info)
+
+    # Only write fields that have non-empty values
+    JSONC_FIELD_MAP.each do |json_key, deliver_filename|
+      value = merged_info[json_key]
+      next if value.nil? || value.to_s.strip.empty?
+
+      FileUtils.mkdir_p(deliver_locale_dir)
+      File.write(File.join(deliver_locale_dir, deliver_filename), value)
+      fields_written += 1
+    end
+
+    # description: locale overrides defaults
+    locale_description = has_locale_dir ? read_text_file(File.join(locale_path, "description.txt")) : nil
+    description = locale_description || defaults_description
+    if description && !description.strip.empty?
+      FileUtils.mkdir_p(deliver_locale_dir)
+      File.write(File.join(deliver_locale_dir, "description.txt"), description)
+      fields_written += 1
+    end
   end
 
   source = has_locale_dir ? "locale + defaults" : "defaults only"

@@ -252,7 +252,12 @@ metadata/
 | `supportUrl` | Support URL |
 | `privacyUrl` | Privacy URL |
 
-**Merge logic:** `defaults/` provides base values; per-locale files override them. For `whatsNew`, the `use_default_whats_new` flag controls whether per-locale files are used or ignored (default: ignored — one shared release note for all locales).
+**Merge logic:** `defaults/` provides base values; per-locale files override them. This applies consistently to `info.jsonc`, `description.txt`, and `whatsNew.txt`.
+
+**Two modes of operation** (controlled by `update_whatsnew_only` input):
+
+- `update_whatsnew_only: true` (default) — Only release notes are uploaded. All other metadata (name, subtitle, description, URLs, etc.) is left untouched on App Store Connect. Perfect for the common release-notes-only update.
+- `update_whatsnew_only: false` — All fields from `defaults/` + locale folders are uploaded. Use this for initial setup or full metadata refresh.
 
 **Screenshots:** Must be PNG, within 20px of the target device dimensions. The workflow automatically scales to exact dimensions and strips the alpha channel.
 
@@ -262,7 +267,7 @@ metadata/
 |---|---|---|
 | `app_version` | `""` | Target app version. Empty = update current draft |
 | `skip_screenshots` | `true` | Skip screenshot upload |
-| `use_default_whats_new` | `true` | Use defaults/whatsNew.txt for all locales |
+| `update_whatsnew_only` | `true` | Only update release notes. All other metadata is left untouched on ASC |
 
 ### Metadata caller workflow
 
@@ -281,8 +286,8 @@ on:
         required: false
         type: boolean
         default: true
-      use_default_whats_new:
-        description: 'Use defaults/whatsNew.txt for all locales'
+      update_whatsnew_only:
+        description: 'Only update release notes (leave all other metadata untouched on ASC)'
         required: false
         type: boolean
         default: true
@@ -293,7 +298,7 @@ jobs:
     with:
       app_version: ${{ inputs.app_version }}
       skip_screenshots: ${{ inputs.skip_screenshots }}
-      use_default_whats_new: ${{ inputs.use_default_whats_new }}
+      update_whatsnew_only: ${{ inputs.update_whatsnew_only }}
     secrets: inherit
 ```
 
