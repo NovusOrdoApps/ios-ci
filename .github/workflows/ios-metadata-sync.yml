@@ -48,14 +48,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.CHECKOUT_PAT }}
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
 
       - name: Checkout ios-ci tooling
         uses: actions/checkout@v4
         with:
           repository: NovusOrdoApps/ios-ci
           path: _ci
-          token: ${{ secrets.CHECKOUT_PAT }}
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
@@ -107,7 +106,7 @@ jobs:
       - name: Create PR
         if: steps.changes.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.CHECKOUT_PAT }}
+          GH_TOKEN: ${{ secrets.CHECKOUT_PAT || github.token }}
         run: |
           BRANCH="metadata-sync/$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$BRANCH"

@@ -50,14 +50,13 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.CHECKOUT_PAT }}
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
 
       - name: Checkout ios-ci tooling
         uses: actions/checkout@v4
         with:
           repository: NovusOrdoApps/ios-ci
           path: _ci
-          token: ${{ secrets.CHECKOUT_PAT }}
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
