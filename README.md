@@ -299,13 +299,56 @@ jobs:
 
 Uses the same App Store Connect secrets as the release workflow. Also requires the `IOS_RELEASE_APP_BUNDLE_ID` variable.
 
+## Submit for Review
+
+A third reusable workflow submits the current editable version for App Store review.
+
+**What it does automatically:**
+- Finds the current editable version on App Store Connect
+- Picks the latest build uploaded to TestFlight
+- Submits for review with `automatic_release: true`
+
+### Required file: `metadata/submission.jsonc`
+
+Answers to Apple's review questions. Customize once per app:
+
+```jsonc
+{
+  "add_id_info_uses_idfa": false,
+  "export_compliance_uses_encryption": true,
+  "export_compliance_is_exempt": true,
+  "export_compliance_encryption_updated": false,
+  "export_compliance_contains_third_party_cryptography": false,
+  "export_compliance_contains_proprietary_cryptography": false,
+  "export_compliance_available_on_french_store": true,
+  "content_rights_has_rights": true,
+  "content_rights_contains_third_party_content": false
+}
+```
+
+### Caller workflow
+
+```yaml
+name: Submit for Review
+
+on:
+  workflow_dispatch:
+
+jobs:
+  submit:
+    uses: your-org/ios-ci/.github/workflows/ios-submit-for-review.yml@main
+    secrets: inherit
+```
+
 ## Files in this repo
 
 ```
 ios-ci/
 ├── .github/workflows/
 │   ├── ios-release.yml             # Reusable workflow (build + release)
-│   └── ios-metadata.yml            # Reusable workflow (metadata + screenshots)
+│   ├── ios-metadata.yml            # Reusable workflow (push metadata + screenshots)
+│   ├── ios-metadata-sync.yml       # Reusable workflow (pull metadata from ASC → PR)
+│   └── ios-submit-for-review.yml   # Reusable workflow (submit current version for review)
 ├── fastlane/
 │   ├── Fastfile                    # Lanes: signing, building, uploading, metadata
 │   ├── Matchfile                   # Points to MATCH_GIT_URL from env
@@ -318,7 +361,8 @@ ios-ci/
     ├── validate-project-contract.rb # Enforces the xcconfig-driven release contract
     ├── generate-export-options.sh  # Builds ExportOptions.plist dynamically
     ├── transform_metadata.rb       # Transforms custom metadata format to deliver format
-    └── transform_screenshots.rb    # Validates and processes screenshots for App Store
+    ├── transform_screenshots.rb    # Validates and processes screenshots for App Store
+    └── reverse_transform_metadata.rb  # Converts deliver format to custom metadata format (for sync)
 ```
 
 ## Updating

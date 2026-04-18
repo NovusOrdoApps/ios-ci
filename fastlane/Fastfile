@@ -187,6 +187,78 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # submit_for_review
+  #
+  # Auto-selects the latest editable version and latest TestFlight build,
+  # then submits for review with automatic_release enabled.
+  #
+  # Requires: submission_info_path pointing to a submission.jsonc file with
+  # answers to Apple's review questions.
+  #
+  # Usage: bundle exec fastlane submit_for_review \
+  #          submission_info_path:/path/to/submission.jsonc
+  # ──────────────────────────────────────────────
+  lane :submit_for_review do |options|
+    require "spaceship"
+    require "json"
+
+    submission_info_path = options[:submission_info_path]
+    UI.user_error!("Missing submission_info_path") if submission_info_path.to_s.empty?
+    UI.user_error!("Submission info file not found: #{submission_info_path}") unless File.exist?(submission_info_path)
+
+    # Parse submission info (JSONC-compatible; strips // comments and trailing commas)
+    raw = File.read(submission_info_path)
+    raw = raw.delete_prefix("\xEF\xBB\xBF")
+    raw = raw.gsub(%r{^\s*//.*$}, "").gsub(/,\s*([}\]])/, '\1')
+    submission_info = JSON.parse(raw)
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    # Find the current editable version
+    version = app.get_edit_app_store_version
+    UI.user_error!("No editable version found on App Store Connect. Create one via Update Metadata first.") unless version
+
+    app_version = version.version_string
+    UI.message(":: Editable version: #{app_version}")
+
+    # Find latest build (sorted by upload date desc, limit 1)
+    builds = Spaceship::ConnectAPI::Build.all(
+      app_id: app.id,
+      sort: "-uploadedDate",
+      limit: 1,
+    )
+    UI.user_error!("No builds found in TestFlight for #{app.bundle_id}") if builds.empty?
+
+    build = builds.first
+    build_number = build.version
+    UI.message(":: Latest TestFlight build: #{build_number}")
+
+    deliver(
+      api_key: api_key,
+      app_identifier: ENV.fetch("APP_BUNDLE_ID"),
+      app_version: app_version,
+      build_number: build_number,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      skip_metadata: true,
+      force: true,
+      submit_for_review: true,
+      automatic_release: true,
+      submission_information: submission_info,
+      precheck_include_in_app_purchases: false,
+    )
+
+    UI.success("Submitted version #{app_version} (build #{build_number}) for review with automatic release.")
+  end
+
+  # ──────────────────────────────────────────────
   # update_metadata
   #
   # Uploads metadata and/or screenshots to App Store Connect.
