@@ -202,14 +202,15 @@ end
 unless skip_screenshots
   screenshots_dir = File.join(input_dir, "Screenshots")
   screenshots_output = File.join(output_dir, "screenshots")
-  if File.directory?(screenshots_dir)
-    require_relative "transform_screenshots"
-    process_screenshots(screenshots_dir, screenshots_output)
-  else
-    # Create empty dir so deliver gets a valid path (it handles empty dirs gracefully)
-    FileUtils.mkdir_p(screenshots_output)
-    puts(":: No Screenshots/ directory found, created empty screenshots output.")
+  unless File.directory?(screenshots_dir)
+    fail_with([
+      "skip_screenshots is false but no Screenshots/ directory found in '#{input_dir}'.",
+      "Uploading with an empty screenshots folder would DELETE all existing screenshots on App Store Connect.",
+      "Either set skip_screenshots=true, or add a Screenshots/ directory with screenshots to upload.",
+    ])
   end
+  require_relative "transform_screenshots"
+  process_screenshots(screenshots_dir, screenshots_output)
 end
 
 puts(":: Transform complete — #{locales.length} locale(s) processed")
