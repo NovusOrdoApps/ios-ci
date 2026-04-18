@@ -2,19 +2,21 @@ require "fileutils"
 require "open3"
 
 # Device folder names match Apple's App Store Connect display type constants
-# (see fastlane's AppScreenshotSet::DisplayType).
+# (see fastlane's AppScreenshotSet::DisplayType). Each entry lists all
+# portrait pixel dimensions Apple accepts for that display type.
+# Source: https://developer.apple.com/help/app-store-connect/reference/screenshot-specifications/
 DEVICE_DIMENSIONS = {
-  "APP_IPHONE_67"         => [1290, 2796],  # iPhone 6.7"
-  "APP_IPHONE_65"         => [1284, 2778],  # iPhone 6.5"
-  "APP_IPHONE_61"         => [1179, 2556],  # iPhone 6.1"
-  "APP_IPHONE_58"         => [1170, 2532],  # iPhone 5.8"
-  "APP_IPHONE_55"         => [1242, 2208],  # iPhone 5.5"
-  "APP_IPHONE_47"         => [750, 1334],   # iPhone 4.7"
-  "APP_IPAD_PRO_3GEN_129" => [2048, 2732],  # iPad Pro 12.9" 3rd gen+
-  "APP_IPAD_PRO_129"      => [2048, 2732],  # iPad Pro 12.9" 2nd gen
-  "APP_IPAD_PRO_3GEN_11"  => [1668, 2388],  # iPad Pro 11" 3rd gen
-  "APP_IPAD_105"          => [1668, 2224],  # iPad 10.5"
-  "APP_IPAD_97"           => [1536, 2048]   # iPad 9.7"
+  "APP_IPHONE_67"         => [[1290, 2796], [1284, 2778]],  # iPhone 6.7"
+  "APP_IPHONE_65"         => [[1242, 2688]],                # iPhone 6.5"
+  "APP_IPHONE_61"         => [[1179, 2556], [1170, 2532], [1125, 2436]],  # iPhone 6.1"
+  "APP_IPHONE_58"         => [[1125, 2436]],                # iPhone 5.8"
+  "APP_IPHONE_55"         => [[1242, 2208]],                # iPhone 5.5"
+  "APP_IPHONE_47"         => [[750, 1334]],                 # iPhone 4.7"
+  "APP_IPAD_PRO_3GEN_129" => [[2048, 2732], [2064, 2752]],  # iPad Pro 12.9" 3rd gen+
+  "APP_IPAD_PRO_129"      => [[2048, 2732]],                # iPad Pro 12.9" 2nd gen
+  "APP_IPAD_PRO_3GEN_11"  => [[1668, 2388], [1668, 2420], [1488, 2266]],  # iPad Pro 11"
+  "APP_IPAD_105"          => [[1668, 2224]],                # iPad 10.5"
+  "APP_IPAD_97"           => [[1536, 2048]]                 # iPad 9.7"
 }.freeze
 
 DIMENSION_TOLERANCE = 20
@@ -24,6 +26,22 @@ def sips_dimensions(path)
   width = output[/pixelWidth:\s*(\d+)/, 1]&.to_i
   height = output[/pixelHeight:\s*(\d+)/, 1]&.to_i
   [width || 0, height || 0]
+end
+
+def closest_target(accepted_sizes, actual_w, actual_h, landscape)
+  # accepted_sizes is array of [portrait_w, portrait_h] pairs.
+  # Orient each to match the actual image, then find the one with minimum diff.
+  best = nil
+  best_diff = nil
+  accepted_sizes.each do |pw, ph|
+    tw, th = landscape ? [ph, pw] : [pw, ph]
+    diff = (actual_w - tw).abs + (actual_h - th).abs
+    if best.nil? || diff < best_diff
+      best = [tw, th]
+      best_diff = diff
+    end
+  end
+  best
 end
 
 def process_screenshots(screenshots_dir, output_dir)
@@ -37,8 +55,8 @@ def process_screenshots(screenshots_dir, output_dir)
     device_folder = parts[1]
     filename = parts[2]
 
-    target = DEVICE_DIMENSIONS[device_folder]
-    unless target
+    accepted = DEVICE_DIMENSIONS[device_folder]
+    unless accepted
       known = DEVICE_DIMENSIONS.keys.join(", ")
       errors << { path: relative, message: "Unknown screenshot device folder '#{device_folder}'. Expected: #{known}." }
       next
@@ -52,21 +70,19 @@ def process_screenshots(screenshots_dir, output_dir)
     end
 
     landscape = actual_w > actual_h
-
-    target_w, target_h = target
-    if landscape
-      target_w, target_h = target_h, target_w
-    end
-
     orientation = landscape ? "landscape" : "portrait"
+
+    target_w, target_h = closest_target(accepted, actual_w, actual_h, landscape)
 
     diff_w = (actual_w - target_w).abs
     diff_h = (actual_h - target_h).abs
 
     if diff_w > DIMENSION_TOLERANCE || diff_h > DIMENSION_TOLERANCE
+      accepted_str = accepted.map { |w, h| landscape ? "#{h}x#{w}" : "#{w}x#{h}" }.join(", ")
       errors << {
         path: relative,
-        message: "Expected: #{target_w} x #{target_h} (#{orientation})\n" \
+        message: "Accepted (#{orientation}): #{accepted_str}\n" \
+                 "    Closest:  #{target_w} x #{target_h}\n" \
                  "    Actual:   #{actual_w} x #{actual_h}\n" \
                  "    Diff:     #{diff_w} x #{diff_h} — exceeds #{DIMENSION_TOLERANCE}px tolerance"
       }
