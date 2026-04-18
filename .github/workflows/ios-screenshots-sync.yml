@@ -100,6 +100,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CHECKOUT_PAT || github.token }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           BRANCH="screenshots-sync/$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$BRANCH"
           git commit -m "sync: pull screenshots from App Store Connect"
