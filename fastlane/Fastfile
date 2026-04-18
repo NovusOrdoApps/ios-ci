@@ -161,29 +161,84 @@ platform :ios do
   # ──────────────────────────────────────────────
   # fetch_metadata
   #
-  # Downloads metadata from App Store Connect into deliver's format.
+  # Downloads metadata from App Store Connect via Spaceship,
+  # writing each locale's fields to deliver-compatible format:
+  #   {output_path}/metadata/{locale}/{field}.txt
+  #
   # Usage: bundle exec fastlane fetch_metadata output_path:/tmp/asc-metadata
   # ──────────────────────────────────────────────
   lane :fetch_metadata do |options|
-    api_key = app_store_connect_api_key(
+    require "spaceship"
+    require "fileutils"
+
+    app_store_connect_api_key(
       key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
       issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
       key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
     )
 
     output_path = options[:output_path] || "."
+    metadata_dir = File.join(output_path, "metadata")
+    FileUtils.mkdir_p(metadata_dir)
 
-    deliver(
-      api_key: api_key,
-      app_identifier: ENV.fetch("APP_BUNDLE_ID"),
-      run_precheck_before_submit: false,
-      skip_binary_upload: true,
-      skip_screenshots: true,
-      force: true,
-      download_metadata: true,
-      metadata_path: File.join(output_path, "metadata"),
-      skip_metadata: false,
-    )
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    # Get version: prefer editable, fall back to live
+    version = app.get_edit_app_store_version || app.get_live_app_store_version
+    UI.user_error!("No app version found on App Store Connect.") unless version
+
+    UI.message(":: Using version #{version.version_string} (state: #{version.app_store_state})")
+
+    # Per-version localizations (description, keywords, marketing_url, promotional_text, support_url, whats_new)
+    version_localizations = version.get_app_store_version_localizations
+
+    # App info localizations (name, subtitle, privacy_policy_url)
+    app_info = app.fetch_edit_app_info || app.fetch_live_app_info
+    app_info_by_locale = {}
+    if app_info
+      app_info.get_app_info_localizations.each do |info_loc|
+        app_info_by_locale[info_loc.locale] = info_loc
+      end
+    end
+
+    version_localizations.each do |loc|
+      locale_dir = File.join(metadata_dir, loc.locale)
+      FileUtils.mkdir_p(locale_dir)
+
+      written = 0
+      {
+        "description.txt"      => loc.description,
+        "keywords.txt"         => loc.keywords,
+        "marketing_url.txt"    => loc.marketing_url,
+        "promotional_text.txt" => loc.promotional_text,
+        "support_url.txt"      => loc.support_url,
+        "release_notes.txt"    => loc.whats_new,
+      }.each do |filename, value|
+        next if value.nil? || value.to_s.strip.empty?
+
+        File.write(File.join(locale_dir, filename), value)
+        written += 1
+      end
+
+      info_loc = app_info_by_locale[loc.locale]
+      if info_loc
+        {
+          "name.txt"        => info_loc.name,
+          "subtitle.txt"    => info_loc.subtitle,
+          "privacy_url.txt" => info_loc.privacy_policy_url,
+        }.each do |filename, value|
+          next if value.nil? || value.to_s.strip.empty?
+
+          File.write(File.join(locale_dir, filename), value)
+          written += 1
+        end
+      end
+
+      UI.message(":: #{loc.locale}: #{written} field(s) written")
+    end
+
+    UI.success("Downloaded metadata for #{version_localizations.size} locale(s) to #{metadata_dir}.")
   end
 
   # ──────────────────────────────────────────────
