@@ -159,6 +159,92 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # fetch_screenshots
+  #
+  # Downloads screenshots from App Store Connect (latest live or editable version)
+  # to disk in this structure:
+  #   {output_path}/Screenshots/{locale}/{display_type}/01.png, 02.png, ...
+  #
+  # display_type uses Apple's actual constants (e.g. APP_IPHONE_67,
+  # APP_IPAD_PRO_3GEN_129, APP_IPAD_PRO_3GEN_11).
+  #
+  # Usage: bundle exec fastlane fetch_screenshots output_path:/path/to/repo
+  # ──────────────────────────────────────────────
+  lane :fetch_screenshots do |options|
+    require "spaceship"
+    require "fileutils"
+    require "open-uri"
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    output_path = options[:output_path] || "."
+    screenshots_dir = File.join(output_path, "Screenshots")
+    FileUtils.mkdir_p(screenshots_dir)
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    # Prefer live version for screenshots (they're the published ones and won't be mid-edit)
+    version = app.get_live_app_store_version || app.get_edit_app_store_version
+    UI.user_error!("No app version found on App Store Connect.") unless version
+
+    UI.message(":: Using version #{version.version_string} (state: #{version.app_store_state})")
+
+    localizations = version.get_app_store_version_localizations
+
+    total_screenshots = 0
+
+    localizations.each do |loc|
+      locale = loc.locale
+      screenshot_sets = loc.get_app_screenshot_sets(includes: "appScreenshots")
+
+      if screenshot_sets.empty?
+        UI.message(":: #{locale}: no screenshots")
+        next
+      end
+
+      locale_count = 0
+
+      screenshot_sets.each do |set|
+        display_type = set.screenshot_display_type
+        next if display_type.nil?
+
+        screenshots = set.app_screenshots || []
+        next if screenshots.empty?
+
+        device_dir = File.join(screenshots_dir, locale, display_type)
+        FileUtils.mkdir_p(device_dir)
+
+        screenshots.each_with_index do |shot, idx|
+          url = shot.image_asset_url(type: "png")
+          unless url
+            UI.important(":: #{locale}/#{display_type}: screenshot #{idx + 1} has no image_asset (skipping)")
+            next
+          end
+
+          filename = format("%02d.png", idx + 1)
+          out_path = File.join(device_dir, filename)
+
+          URI.open(url) do |remote|
+            File.binwrite(out_path, remote.read)
+          end
+
+          locale_count += 1
+          total_screenshots += 1
+        end
+      end
+
+      UI.message(":: #{locale}: #{locale_count} screenshot(s) downloaded")
+    end
+
+    UI.success("Downloaded #{total_screenshots} screenshot(s) across #{localizations.size} locale(s) to #{screenshots_dir}.")
+  end
+
+  # ──────────────────────────────────────────────
   # fetch_metadata
   #
   # Downloads metadata from App Store Connect via Spaceship,

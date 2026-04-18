@@ -1,12 +1,20 @@
 require "fileutils"
 require "open3"
 
+# Device folder names match Apple's App Store Connect display type constants
+# (see fastlane's AppScreenshotSet::DisplayType).
 DEVICE_DIMENSIONS = {
-  "APP_IPHONE_67" => [1290, 2796],
-  "APP_IPHONE_65" => [1284, 2778],
-  "APP_IPHONE_55" => [1242, 2208],
-  "APP_IPAD_129"  => [2048, 2732],
-  "APP_IPAD_110"  => [1668, 2388]
+  "APP_IPHONE_67"         => [1290, 2796],  # iPhone 6.7"
+  "APP_IPHONE_65"         => [1284, 2778],  # iPhone 6.5"
+  "APP_IPHONE_61"         => [1179, 2556],  # iPhone 6.1"
+  "APP_IPHONE_58"         => [1170, 2532],  # iPhone 5.8"
+  "APP_IPHONE_55"         => [1242, 2208],  # iPhone 5.5"
+  "APP_IPHONE_47"         => [750, 1334],   # iPhone 4.7"
+  "APP_IPAD_PRO_3GEN_129" => [2048, 2732],  # iPad Pro 12.9" 3rd gen+
+  "APP_IPAD_PRO_129"      => [2048, 2732],  # iPad Pro 12.9" 2nd gen
+  "APP_IPAD_PRO_3GEN_11"  => [1668, 2388],  # iPad Pro 11" 3rd gen
+  "APP_IPAD_105"          => [1668, 2224],  # iPad 10.5"
+  "APP_IPAD_97"           => [1536, 2048]   # iPad 9.7"
 }.freeze
 
 DIMENSION_TOLERANCE = 20

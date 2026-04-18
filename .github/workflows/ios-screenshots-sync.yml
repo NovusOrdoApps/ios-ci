@@ -1,0 +1,125 @@
+# Reusable workflow: Pull screenshots from App Store Connect and open a PR.
+#
+# Downloads screenshots from the current live (or editable) version on ASC,
+# saves them to metadata/Screenshots/{locale}/{display_type}/ and opens a PR.
+#
+# Uses Apple's actual display type constants as folder names
+# (e.g., APP_IPHONE_67, APP_IPAD_PRO_3GEN_129).
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT (optional; falls back to GITHUB_TOKEN if repo allows write)
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS Screenshots Sync (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+
+concurrency:
+  group: ios-screenshots-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-screenshots:
+    name: Sync Screenshots from App Store Connect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+
+      - name: Download screenshots from App Store Connect
+        working-directory: _ci
+        run: |
+          bundle exec fastlane fetch_screenshots \
+            output_path:"$GITHUB_WORKSPACE/metadata"
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git add metadata/Screenshots/
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo ":: No changes detected — screenshots are already in sync."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo ":: Changes detected, will open PR."
+          fi
+
+      - name: Create PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CHECKOUT_PAT || github.token }}
+        run: |
+          BRANCH="screenshots-sync/$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git commit -m "sync: pull screenshots from App Store Connect"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "Sync screenshots from App Store Connect" \
+            --body "$(cat <<'BODY'
+          ## Summary
+
+          Pulled screenshots from the current live version on App Store Connect.
+
+          Files are organized as `metadata/Screenshots/{locale}/{display_type}/NN.png`.
+
+          Display types use Apple's actual constants (e.g., `APP_IPHONE_67`, `APP_IPAD_PRO_3GEN_129`).
+
+          **Review the screenshots and merge when ready.**
+          BODY
+          )"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
