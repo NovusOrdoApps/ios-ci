@@ -127,13 +127,25 @@ signable_targets.each do |target_info|
     next
   end
 
+  # Set the base (unconditional) values
   build_config.build_settings["DEVELOPMENT_TEAM"] = release_team_id
   build_config.build_settings["PRODUCT_BUNDLE_IDENTIFIER"] = desired_bundle_id
+
+  # Remove any conditional variants like "DEVELOPMENT_TEAM[sdk=iphoneos*]"
+  # so the base value takes effect for all build conditions.
+  removed_conditionals = []
+  build_config.build_settings.keys.each do |key|
+    if key =~ /\A(DEVELOPMENT_TEAM|PRODUCT_BUNDLE_IDENTIFIER)\[/
+      build_config.build_settings.delete(key)
+      removed_conditionals << key
+    end
+  end
 
   patched << {
     name: target_name,
     current_bundle_id: current_bundle_id,
-    desired_bundle_id: desired_bundle_id
+    desired_bundle_id: desired_bundle_id,
+    removed_conditionals: removed_conditionals
   }
 end
 
@@ -144,5 +156,8 @@ project.save
 puts(":: Patched configuration '#{configuration}' in '#{project_path}'")
 patched.each do |entry|
   puts(":: #{entry[:name]}: #{entry[:current_bundle_id]} -> #{entry[:desired_bundle_id]}")
+  entry[:removed_conditionals].each do |key|
+    puts(":: #{entry[:name]}: removed conditional '#{key}'")
+  end
 end
 puts(":: DEVELOPMENT_TEAM -> #{release_team_id}")
