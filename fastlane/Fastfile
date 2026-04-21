@@ -122,9 +122,14 @@ platform :ios do
   #          export_options:/path/to/ExportOptions.plist
   # ──────────────────────────────────────────────
   lane :build_native do |options|
+    # build_app requires exactly ONE of workspace/project. Prefer workspace.
+    workspace = options[:workspace].to_s.empty? ? nil : options[:workspace]
+    project = options[:project].to_s.empty? ? nil : options[:project]
+    project = nil if workspace
+
     build_app(
-      workspace: options[:workspace].to_s.empty? ? nil : options[:workspace],
-      project: options[:project].to_s.empty? ? nil : options[:project],
+      workspace: workspace,
+      project: project,
       scheme: options[:scheme],
       configuration: options[:configuration].to_s.empty? ? "Release" : options[:configuration],
       export_options: options[:export_options],
