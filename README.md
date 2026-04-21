@@ -77,6 +77,7 @@ Most apps do not need these. They are only for projects whose secondary targets 
 |---|---|
 | `IOS_RELEASE_EXTENSION_BUNDLE_ID` | Optional exact bundle ID when there is exactly one extension target |
 | `IOS_RELEASE_TARGET_BUNDLE_IDS_JSON` | Optional JSON map of target name -> bundle ID for complex apps |
+| `MATCH_GIT_BRANCH` | Optional match git branch — use when the match repo is shared across multiple Apple teams (one branch per team to avoid cert conflicts) |
 
 Example:
 

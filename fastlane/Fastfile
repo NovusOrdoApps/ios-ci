@@ -46,6 +46,12 @@ platform :ios do
       readonly: false,
     }
 
+    # Optional: isolate certificates on a specific branch of the match repo.
+    # Useful when the same match repo is shared across multiple Apple teams
+    # (each team should have its own branch to avoid cert conflicts).
+    match_branch = ENV["MATCH_GIT_BRANCH"].to_s.strip
+    match_opts[:git_branch] = match_branch unless match_branch.empty?
+
     match_opts[:force_for_new_devices] = true if type.to_s == "adhoc"
 
     match(match_opts)
