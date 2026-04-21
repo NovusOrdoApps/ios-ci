@@ -29,7 +29,7 @@ on:
         description: "macOS runner label"
         required: false
         type: string
-        default: "macos-15"
+        default: "macos-26"
       ruby_version:
         description: "Ruby version for fastlane"
         required: false

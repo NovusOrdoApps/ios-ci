@@ -32,7 +32,7 @@ concurrency:
 jobs:
   sync-metadata:
     name: Sync Metadata from App Store Connect
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
 
     permissions:

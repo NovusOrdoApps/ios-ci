@@ -43,7 +43,7 @@ on:
         description: "macOS runner label (needed for sips screenshot processing)"
         required: false
         type: string
-        default: "macos-15"
+        default: "macos-26"
 
 concurrency:
   group: ios-metadata-${{ github.repository }}-${{ github.ref }}
