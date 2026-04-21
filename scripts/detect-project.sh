@@ -190,7 +190,7 @@ while IFS= read -r target; do
     TEAM_ID="$TARGET_TEAM"
   fi
 
-  TARGETS_JSON=$(echo "$TARGETS_JSON" | jq \
+  TARGETS_JSON=$(echo "$TARGETS_JSON" | jq -c \
     --arg name "$target" \
     --arg bid "$BUNDLE_ID" \
     --arg ptype "$PRODUCT_TYPE" \
