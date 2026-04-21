@@ -19,6 +19,11 @@ name: iOS Metadata Sync (Reusable)
 on:
   workflow_call:
     inputs:
+      source:
+        description: "Which version to fetch from: 'live' (currently released) or 'edit' (editable draft)"
+        required: false
+        type: string
+        default: "live"
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -78,7 +83,8 @@ jobs:
         working-directory: _ci
         run: |
           bundle exec fastlane fetch_metadata \
-            output_path:"$RUNNER_TEMP/asc-download"
+            output_path:"$RUNNER_TEMP/asc-download" \
+            source:"${{ inputs.source }}"
 
       - name: Reverse transform to custom format
         run: |

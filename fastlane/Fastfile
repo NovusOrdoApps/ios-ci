@@ -210,17 +210,25 @@ platform :ios do
     )
 
     output_path = options[:output_path] || "."
+    source = (options[:source] || "live").to_s  # "live" (default) or "edit"
     screenshots_dir = File.join(output_path, "Screenshots")
     FileUtils.mkdir_p(screenshots_dir)
 
     app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
-    # Prefer live version for screenshots (they're the published ones and won't be mid-edit)
-    version = app.get_live_app_store_version || app.get_edit_app_store_version
+    version =
+      case source
+      when "edit"
+        app.get_edit_app_store_version || app.get_live_app_store_version
+      when "live"
+        app.get_live_app_store_version || app.get_edit_app_store_version
+      else
+        UI.user_error!("Invalid source '#{source}'. Use 'live' or 'edit'.")
+      end
     UI.user_error!("No app version found on App Store Connect.") unless version
 
-    UI.message(":: Using version #{version.version_string} (state: #{version.app_store_state})")
+    UI.message(":: Fetching from version #{version.version_string} (state: #{version.app_store_state}, source preference: #{source})")
 
     localizations = version.get_app_store_version_localizations
 
@@ -292,23 +300,30 @@ platform :ios do
     )
 
     output_path = options[:output_path] || "."
+    source = (options[:source] || "live").to_s  # "live" (default) or "edit"
     metadata_dir = File.join(output_path, "metadata")
     FileUtils.mkdir_p(metadata_dir)
 
     app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
-    # Get version: prefer editable, fall back to live
-    version = app.get_edit_app_store_version || app.get_live_app_store_version
+    version, app_info =
+      case source
+      when "edit"
+        [app.get_edit_app_store_version || app.get_live_app_store_version,
+         app.fetch_edit_app_info || app.fetch_live_app_info]
+      when "live"
+        [app.get_live_app_store_version || app.get_edit_app_store_version,
+         app.fetch_live_app_info || app.fetch_edit_app_info]
+      else
+        UI.user_error!("Invalid source '#{source}'. Use 'live' or 'edit'.")
+      end
     UI.user_error!("No app version found on App Store Connect.") unless version
 
-    UI.message(":: Using version #{version.version_string} (state: #{version.app_store_state})")
+    UI.message(":: Fetching from version #{version.version_string} (state: #{version.app_store_state}, source preference: #{source})")
 
     # Per-version localizations (description, keywords, marketing_url, promotional_text, support_url, whats_new)
     version_localizations = version.get_app_store_version_localizations
-
-    # App info localizations (name, subtitle, privacy_policy_url)
-    app_info = app.fetch_edit_app_info || app.fetch_live_app_info
     app_info_by_locale = {}
     if app_info
       app_info.get_app_info_localizations.each do |info_loc|

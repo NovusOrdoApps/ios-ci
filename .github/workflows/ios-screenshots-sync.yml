@@ -22,6 +22,11 @@ name: iOS Screenshots Sync (Reusable)
 on:
   workflow_call:
     inputs:
+      source:
+        description: "Which version to fetch from: 'live' (currently released) or 'edit' (editable draft)"
+        required: false
+        type: string
+        default: "live"
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -81,7 +86,8 @@ jobs:
         working-directory: _ci
         run: |
           bundle exec fastlane fetch_screenshots \
-            output_path:"$GITHUB_WORKSPACE/metadata"
+            output_path:"$GITHUB_WORKSPACE/metadata" \
+            source:"${{ inputs.source }}"
 
       - name: Check for changes
         id: changes
