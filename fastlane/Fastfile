@@ -46,10 +46,17 @@ platform :ios do
       readonly: false,
     }
 
-    # Optional: isolate certificates on a specific branch of the match repo.
-    # Useful when the same match repo is shared across multiple Apple teams
-    # (each team should have its own branch to avoid cert conflicts).
+    # Isolate each Apple team's certificates on its own branch in the match repo.
+    # Match doesn't support multi-team in a single branch — its cert verification
+    # treats every cert in the folder as belonging to the current team and
+    # errors when it sees one that doesn't.
+    #
+    # Default: branch is "team-<IOS_RELEASE_TEAM_ID>". Override with MATCH_GIT_BRANCH.
     match_branch = ENV["MATCH_GIT_BRANCH"].to_s.strip
+    if match_branch.empty?
+      team_id = ENV["IOS_RELEASE_TEAM_ID"].to_s.strip
+      match_branch = "team-#{team_id}" unless team_id.empty?
+    end
     match_opts[:git_branch] = match_branch unless match_branch.empty?
 
     match_opts[:force_for_new_devices] = true if type.to_s == "adhoc"
