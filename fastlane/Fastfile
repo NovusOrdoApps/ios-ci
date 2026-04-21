@@ -123,8 +123,18 @@ platform :ios do
   # ──────────────────────────────────────────────
   lane :build_native do |options|
     # build_app requires exactly ONE of workspace/project. Prefer workspace.
-    workspace = options[:workspace].to_s.empty? ? nil : options[:workspace]
-    project = options[:project].to_s.empty? ? nil : options[:project]
+    # Workflow may pass "$GITHUB_WORKSPACE/" (repo root) when detection found no
+    # workspace, so validate the actual value ends with .xcworkspace.
+    workspace = options[:workspace].to_s.strip
+    workspace = nil unless workspace.end_with?(".xcworkspace")
+
+    project = options[:project].to_s.strip
+    project = nil unless project.end_with?(".xcodeproj")
+
+    if workspace.nil? && project.nil?
+      UI.user_error!("Neither a .xcworkspace nor a .xcodeproj was provided to build_native.")
+    end
+
     project = nil if workspace
 
     build_app(
