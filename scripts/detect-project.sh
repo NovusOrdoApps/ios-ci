@@ -185,9 +185,13 @@ while IFS= read -r target; do
     }
   ')
 
-  BUNDLE_ID=$(echo "$SETTINGS" | grep '^\s*PRODUCT_BUNDLE_IDENTIFIER' | head -1 | awk -F '= ' '{print $2}' | xargs)
-  PRODUCT_TYPE=$(echo "$SETTINGS" | grep '^\s*PRODUCT_TYPE' | head -1 | awk -F '= ' '{print $2}' | xargs)
-  TARGET_TEAM=$(echo "$SETTINGS" | grep '^\s*DEVELOPMENT_TEAM' | head -1 | awk -F '= ' '{print $2}' | xargs)
+  # Extract build settings via awk. Using awk (not grep) is critical: grep
+  # returns exit 1 on no-match, which under `set -euo pipefail` would silently
+  # exit the script. xcodebuild omits empty settings from output, so any setting
+  # set to "" in the project won't appear — we must tolerate that gracefully.
+  BUNDLE_ID=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER[[:space:]]*=/ {print $2; exit}' | xargs)
+  PRODUCT_TYPE=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*PRODUCT_TYPE[[:space:]]*=/ {print $2; exit}' | xargs)
+  TARGET_TEAM=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ {print $2; exit}' | xargs)
 
   # Skip targets without bundle IDs or non-app targets (frameworks, tests)
   [ -z "$BUNDLE_ID" ] && continue
