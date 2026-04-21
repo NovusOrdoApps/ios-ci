@@ -5,18 +5,23 @@ require "open3"
 # (see fastlane's AppScreenshotSet::DisplayType). Each entry lists all
 # portrait pixel dimensions Apple accepts for that display type.
 # Source: https://developer.apple.com/help/app-store-connect/reference/screenshot-specifications/
+#
+# Some display types accept multiple sizes — including sizes that overlap
+# with neighboring display types. For example, APP_IPHONE_65 accepts
+# 1284x2778 even though that's the "6.7" Display" portrait size, because
+# Apple lets you upload 6.7" screenshots to satisfy the 6.5" requirement.
 DEVICE_DIMENSIONS = {
-  "APP_IPHONE_67"         => [[1290, 2796], [1284, 2778]],  # iPhone 6.7"
-  "APP_IPHONE_65"         => [[1242, 2688]],                # iPhone 6.5"
-  "APP_IPHONE_61"         => [[1179, 2556], [1170, 2532], [1125, 2436]],  # iPhone 6.1"
-  "APP_IPHONE_58"         => [[1125, 2436]],                # iPhone 5.8"
-  "APP_IPHONE_55"         => [[1242, 2208]],                # iPhone 5.5"
-  "APP_IPHONE_47"         => [[750, 1334]],                 # iPhone 4.7"
-  "APP_IPAD_PRO_3GEN_129" => [[2048, 2732], [2064, 2752]],  # iPad Pro 12.9" 3rd gen+
-  "APP_IPAD_PRO_129"      => [[2048, 2732]],                # iPad Pro 12.9" 2nd gen
-  "APP_IPAD_PRO_3GEN_11"  => [[1668, 2388], [1668, 2420], [1488, 2266]],  # iPad Pro 11"
-  "APP_IPAD_105"          => [[1668, 2224]],                # iPad 10.5"
-  "APP_IPAD_97"           => [[1536, 2048]]                 # iPad 9.7"
+  "APP_IPHONE_67"         => [[1290, 2796], [1284, 2778]],               # iPhone 6.7"
+  "APP_IPHONE_65"         => [[1242, 2688], [1284, 2778], [1290, 2796]], # iPhone 6.5" (also accepts 6.7" sizes)
+  "APP_IPHONE_61"         => [[1179, 2556], [1170, 2532], [1125, 2436]], # iPhone 6.1"
+  "APP_IPHONE_58"         => [[1125, 2436]],                             # iPhone 5.8"
+  "APP_IPHONE_55"         => [[1242, 2208]],                             # iPhone 5.5"
+  "APP_IPHONE_47"         => [[750, 1334]],                              # iPhone 4.7"
+  "APP_IPAD_PRO_3GEN_129" => [[2048, 2732], [2064, 2752]],               # iPad Pro 12.9" 3rd gen+
+  "APP_IPAD_PRO_129"      => [[2048, 2732]],                             # iPad Pro 12.9" 2nd gen
+  "APP_IPAD_PRO_3GEN_11"  => [[1668, 2388], [1668, 2420], [1488, 2266]], # iPad Pro 11"
+  "APP_IPAD_105"          => [[1668, 2224]],                             # iPad 10.5"
+  "APP_IPAD_97"           => [[1536, 2048]]                              # iPad 9.7"
 }.freeze
 
 DIMENSION_TOLERANCE = 20
