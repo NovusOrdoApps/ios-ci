@@ -138,16 +138,30 @@ if [ -z "$PROJECT" ]; then
 fi
 
 # ── Detect targets, bundle IDs, team ID ────────
-SCHEME_SETTINGS=$(xcodebuild -showBuildSettings $LIST_FLAG -scheme "$SCHEME" -configuration "$CONFIGURATION" 2>/dev/null || true)
+XCB_STDERR=$(mktemp)
+SCHEME_SETTINGS=$(xcodebuild -showBuildSettings $LIST_FLAG -scheme "$SCHEME" -configuration "$CONFIGURATION" 2>"$XCB_STDERR" || true)
 
 if [ -z "$SCHEME_SETTINGS" ]; then
   echo "ERROR: Could not read build settings for scheme '$SCHEME' configuration '$CONFIGURATION'" >&2
+  echo "xcodebuild stderr:" >&2
+  cat "$XCB_STDERR" >&2
+  rm -f "$XCB_STDERR"
   exit 1
 fi
+
+rm -f "$XCB_STDERR"
 
 TARGETS_RAW=$(printf '%s\n' "$SCHEME_SETTINGS" \
   | sed -n 's/^Build settings for action build and target \(.*\):$/\1/p' \
   | awk '!seen[$0]++')
+
+if [ -z "$TARGETS_RAW" ]; then
+  echo "ERROR: Could not parse any targets from xcodebuild output." >&2
+  echo "This usually means xcodebuild failed or returned an unexpected format." >&2
+  echo "First 30 lines of xcodebuild output:" >&2
+  printf '%s\n' "$SCHEME_SETTINGS" | head -30 >&2
+  exit 1
+fi
 
 TARGETS_JSON="[]"
 APP_IDS=""
