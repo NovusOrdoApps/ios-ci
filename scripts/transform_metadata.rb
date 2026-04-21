@@ -13,6 +13,20 @@ JSONC_FIELD_MAP = {
   "privacyUrl" => "privacy_url.txt"
 }.freeze
 
+# Apple's published character limits for App Store metadata fields.
+# Source: https://developer.apple.com/help/app-store-connect/reference/app-information
+FIELD_LIMITS = {
+  "name"            => 30,
+  "subtitle"        => 30,
+  "keywords"        => 100,
+  "promotionalText" => 170,
+  "marketingUrl"    => 255,
+  "supportUrl"      => 255,
+  "privacyUrl"      => 255,
+  "description"     => 4000,
+  "whatsNew"        => 4000
+}.freeze
+
 def fail_with(errors)
   errors.each { |error| warn("ERROR: #{error}") }
   exit(1)
@@ -150,20 +164,25 @@ else
   puts(":: Mode: full metadata (all fields from defaults + locale will be uploaded)")
 end
 
+# Phase 1: Collect per-locale data (don't write yet — validate first)
+locale_data = []
+
 locales.each do |locale|
   locale_path = File.join(text_dir, locale)
   has_locale_dir = File.directory?(locale_path)
-  deliver_locale_dir = File.join(metadata_output, locale)
-
-  fields_written = 0
 
   # whatsNew → release_notes.txt (locale overrides defaults)
   locale_whats_new = has_locale_dir ? read_text_file(File.join(locale_path, "whatsNew.txt")) : nil
   whats_new = locale_whats_new || defaults_whats_new
+
+  entry = {
+    locale: locale,
+    has_locale_dir: has_locale_dir,
+    fields: {}  # jsonc_key => value (or "description" / "whatsNew" for long text)
+  }
+
   if whats_new && !whats_new.strip.empty?
-    FileUtils.mkdir_p(deliver_locale_dir)
-    File.write(File.join(deliver_locale_dir, "release_notes.txt"), whats_new)
-    fields_written += 1
+    entry[:fields]["whatsNew"] = whats_new
   end
 
   unless update_whatsnew_only
@@ -171,32 +190,78 @@ locales.each do |locale|
     locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
     merged_info = defaults_info.merge(locale_info)
 
-    # Only write fields that have non-empty values
-    JSONC_FIELD_MAP.each do |json_key, deliver_filename|
+    JSONC_FIELD_MAP.each_key do |json_key|
       value = merged_info[json_key]
       next if value.nil? || value.to_s.strip.empty?
 
-      FileUtils.mkdir_p(deliver_locale_dir)
-      File.write(File.join(deliver_locale_dir, deliver_filename), value)
-      fields_written += 1
+      entry[:fields][json_key] = value
     end
 
     # description: locale overrides defaults
     locale_description = has_locale_dir ? read_text_file(File.join(locale_path, "description.txt")) : nil
     description = locale_description || defaults_description
     if description && !description.strip.empty?
-      FileUtils.mkdir_p(deliver_locale_dir)
-      File.write(File.join(deliver_locale_dir, "description.txt"), description)
-      fields_written += 1
+      entry[:fields]["description"] = description
     end
   end
 
-  source = has_locale_dir ? "locale + defaults" : "defaults only"
-  if fields_written > 0
-    puts(":: #{locale}: #{fields_written} field(s) written (#{source})")
-  else
-    puts(":: #{locale}: skipped (no data)")
+  locale_data << entry
+end
+
+# Phase 2: Validate all fields against Apple's published limits. Collect all
+# errors, then fail with a full report if any exist (don't stop at first).
+validation_errors = []
+
+locale_data.each do |entry|
+  entry[:fields].each do |field, value|
+    limit = FIELD_LIMITS[field]
+    next unless limit
+
+    stripped = value.strip
+    if stripped.length > limit
+      validation_errors << {
+        locale: entry[:locale],
+        field: field,
+        actual: stripped.length,
+        limit: limit,
+        preview: stripped[0, 40].gsub(/\s+/, " ") + (stripped.length > 40 ? "…" : "")
+      }
+    end
   end
+end
+
+unless validation_errors.empty?
+  message = "Metadata validation failed:\n\n"
+  validation_errors.each do |err|
+    message += "  #{err[:locale]}/#{err[:field]}\n"
+    message += "    Limit:   #{err[:limit]} characters\n"
+    message += "    Actual:  #{err[:actual]} characters\n"
+    message += "    Value:   #{err[:preview].inspect}\n\n"
+  end
+  message += "#{validation_errors.length} error(s) found. Fix metadata before uploading."
+  abort(message)
+end
+
+# Phase 3: Write the output (validation passed)
+locale_data.each do |entry|
+  locale = entry[:locale]
+  next if entry[:fields].empty?
+
+  deliver_locale_dir = File.join(metadata_output, locale)
+  FileUtils.mkdir_p(deliver_locale_dir)
+
+  entry[:fields].each do |field, value|
+    filename =
+      case field
+      when "description" then "description.txt"
+      when "whatsNew"    then "release_notes.txt"
+      else JSONC_FIELD_MAP[field]
+      end
+    File.write(File.join(deliver_locale_dir, filename), value)
+  end
+
+  source = entry[:has_locale_dir] ? "locale + defaults" : "defaults only"
+  puts(":: #{locale}: #{entry[:fields].size} field(s) written (#{source})")
 end
 
 unless skip_screenshots
