@@ -52,9 +52,14 @@ find_xcode() {
 
   # Fall back: search any first-level subdirectory
   for dir in */; do
-    [ "$dir" = "ios/" ] && continue   # already checked
-    [ "$dir" = "_ci/" ] && continue   # skip CI tooling
-    [ "$dir" = "Pods/" ] && continue  # skip CocoaPods
+    [ "$dir" = "ios/" ] && continue     # already checked
+    [ "$dir" = "_ci/" ] && continue     # skip CI tooling
+    [ "$dir" = "Pods/" ] && continue    # skip CocoaPods
+    case "$dir" in
+      *.xcodeproj/|*.xcworkspace/)
+        continue                         # never descend into Xcode bundles
+        ;;
+    esac
     local found
     found=$(find "$dir" -maxdepth 1 -name "*.$ext" ! -name "Pods*" 2>/dev/null | head -1)
     if [ -n "$found" ]; then
