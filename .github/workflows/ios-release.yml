@@ -50,6 +50,11 @@ on:
         required: false
         type: string
         default: "managed"
+      app_version:
+        description: "Explicit marketing version (e.g. '1.2.3'). When empty, derived from the GitHub release tag or pushed git tag."
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ios-release-${{ github.repository }}-${{ github.ref }}
@@ -143,25 +148,34 @@ jobs:
 
       - name: Resolve release version metadata
         id: version_meta
+        env:
+          INPUT_APP_VERSION: ${{ inputs.app_version }}
         run: |
+          # Precedence: explicit app_version input > GitHub release tag > pushed git tag
           TAG=""
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
+          SOURCE=""
+          if [ -n "$INPUT_APP_VERSION" ]; then
+            TAG="$INPUT_APP_VERSION"
+            SOURCE="explicit input"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
             TAG="${{ github.event.release.tag_name }}"
+            SOURCE="release tag"
           elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME:-}"
+            SOURCE="pushed tag"
           fi
 
           if [ -n "$TAG" ]; then
             VERSION="${TAG#v}"
             if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
-              echo "ERROR: Release tags must look like v1.2.3 or 1.2.3. Got '$TAG'." >&2
+              echo "ERROR: app_version must look like v1.2.3 or 1.2.3. Got '$TAG' (source: $SOURCE)." >&2
               exit 1
             fi
             echo "marketing_version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo ":: Release tag '$TAG' -> MARKETING_VERSION=$VERSION"
+            echo ":: $SOURCE '$TAG' -> MARKETING_VERSION=$VERSION"
           else
             echo "marketing_version=" >> "$GITHUB_OUTPUT"
-            echo ":: No release tag detected. Keeping the project's existing marketing version."
+            echo ":: No app_version provided and no release/tag detected. Keeping the project's existing marketing version."
           fi
 
           # Combine run number and attempt so re-runs of the same workflow
