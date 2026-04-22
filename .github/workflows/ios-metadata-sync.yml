@@ -24,6 +24,16 @@ on:
         required: false
         type: string
         default: "live"
+      max_attempts:
+        description: "Number of poll attempts. If no changes are detected, retry up to this many times."
+        required: false
+        type: number
+        default: 1
+      poll_interval_seconds:
+        description: "Seconds to wait between poll attempts."
+        required: false
+        type: number
+        default: 60
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -79,34 +89,51 @@ jobs:
           : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
 
-      - name: Download metadata from App Store Connect
-        working-directory: _ci
-        run: |
-          bundle exec fastlane fetch_metadata \
-            output_path:"$RUNNER_TEMP/asc-download" \
-            source:"${{ inputs.source }}"
-
-      - name: Reverse transform to custom format
-        run: |
-          # Clear existing metadata text (keep Screenshots if any)
-          if [ -d "metadata/Text" ]; then
-            rm -rf metadata/Text
-          fi
-
-          ruby _ci/scripts/reverse_transform_metadata.rb \
-            --input "$RUNNER_TEMP/asc-download/metadata" \
-            --output "metadata/Text"
-
-      - name: Check for changes
+      - name: Sync metadata (with optional polling)
         id: changes
+        env:
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
+          SOURCE: ${{ inputs.source }}
         run: |
-          git add metadata/Text/
-          if git diff --cached --quiet; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo ":: No changes detected — repo is already in sync."
+          attempt=1
+          has_changes="false"
+
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            echo ":: Attempt $attempt/$MAX_ATTEMPTS"
+
+            rm -rf "$RUNNER_TEMP/asc-download"
+
+            (cd _ci && bundle exec fastlane fetch_metadata \
+              output_path:"$RUNNER_TEMP/asc-download" \
+              source:"$SOURCE")
+
+            if [ -d "metadata/Text" ]; then
+              rm -rf metadata/Text
+            fi
+            ruby _ci/scripts/reverse_transform_metadata.rb \
+              --input "$RUNNER_TEMP/asc-download/metadata" \
+              --output "metadata/Text"
+
+            if [ -n "$(git status --porcelain metadata/Text/)" ]; then
+              has_changes="true"
+              echo ":: Changes detected on attempt $attempt"
+              break
+            fi
+
+            echo ":: No changes detected on attempt $attempt"
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo ":: Sleeping $POLL_INTERVAL seconds before retry..."
+              sleep "$POLL_INTERVAL"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
+          if [ "$has_changes" = "true" ]; then
+            git add metadata/Text/
           else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo ":: Changes detected, will open PR."
+            echo ":: No changes after $MAX_ATTEMPTS attempt(s) — repo is already in sync."
           fi
 
       - name: Create PR

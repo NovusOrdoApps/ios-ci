@@ -27,6 +27,16 @@ on:
         required: false
         type: string
         default: "live"
+      max_attempts:
+        description: "Number of poll attempts. If no changes are detected, retry up to this many times."
+        required: false
+        type: number
+        default: 1
+      poll_interval_seconds:
+        description: "Seconds to wait between poll attempts."
+        required: false
+        type: number
+        default: 60
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -82,23 +92,46 @@ jobs:
           : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
 
-      - name: Download screenshots from App Store Connect
-        working-directory: _ci
-        run: |
-          bundle exec fastlane fetch_screenshots \
-            output_path:"$GITHUB_WORKSPACE/metadata" \
-            source:"${{ inputs.source }}"
-
-      - name: Check for changes
+      - name: Sync screenshots (with optional polling)
         id: changes
+        env:
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          POLL_INTERVAL: ${{ inputs.poll_interval_seconds }}
+          SOURCE: ${{ inputs.source }}
         run: |
-          git add metadata/Screenshots/
-          if git diff --cached --quiet; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo ":: No changes detected — screenshots are already in sync."
+          attempt=1
+          has_changes="false"
+
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            echo ":: Attempt $attempt/$MAX_ATTEMPTS"
+
+            if [ -d "metadata/Screenshots" ]; then
+              rm -rf metadata/Screenshots
+            fi
+
+            (cd _ci && bundle exec fastlane fetch_screenshots \
+              output_path:"$GITHUB_WORKSPACE/metadata" \
+              source:"$SOURCE")
+
+            if [ -n "$(git status --porcelain metadata/Screenshots/)" ]; then
+              has_changes="true"
+              echo ":: Changes detected on attempt $attempt"
+              break
+            fi
+
+            echo ":: No changes detected on attempt $attempt"
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo ":: Sleeping $POLL_INTERVAL seconds before retry..."
+              sleep "$POLL_INTERVAL"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
+          if [ "$has_changes" = "true" ]; then
+            git add metadata/Screenshots/
           else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo ":: Changes detected, will open PR."
+            echo ":: No changes after $MAX_ATTEMPTS attempt(s) — screenshots are already in sync."
           fi
 
       - name: Create PR
