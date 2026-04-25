@@ -103,6 +103,9 @@ def parse_cli_args(argv)
     when "--update-whatsnew-only"
       args[:update_whatsnew_only] = argv[i + 1] == "true"
       i += 2
+    when "--update-promotional-text-only"
+      args[:update_promotional_text_only] = argv[i + 1] == "true"
+      i += 2
     when "--skip-screenshots"
       args[:skip_screenshots] = argv[i + 1] == "true"
       i += 2
@@ -117,6 +120,7 @@ def parse_cli_args(argv)
   fail_with(errors) unless errors.empty?
 
   args[:update_whatsnew_only] = true if args[:update_whatsnew_only].nil?
+  args[:update_promotional_text_only] = false if args[:update_promotional_text_only].nil?
   args[:skip_screenshots] = true if args[:skip_screenshots].nil?
 
   args
@@ -127,7 +131,9 @@ args = parse_cli_args(ARGV)
 input_dir = File.expand_path(args[:input])
 output_dir = File.expand_path(args[:output])
 update_whatsnew_only = args[:update_whatsnew_only]
+update_promotional_text_only = args[:update_promotional_text_only]
 skip_screenshots = args[:skip_screenshots]
+full_mode = !update_whatsnew_only && !update_promotional_text_only
 
 text_dir = File.join(input_dir, "Text")
 unless File.directory?(text_dir)
@@ -158,10 +164,13 @@ defaults_whats_new = read_text_file(File.join(defaults_dir, "whatsNew.txt"))
 
 metadata_output = File.join(output_dir, "metadata")
 
-if update_whatsnew_only
-  puts(":: Mode: whatsNew-only (no other metadata fields will be uploaded)")
-else
+if full_mode
   puts(":: Mode: full metadata (all fields from defaults + locale will be uploaded)")
+else
+  selected = []
+  selected << "whatsNew" if update_whatsnew_only
+  selected << "promotionalText" if update_promotional_text_only
+  puts(":: Mode: partial — #{selected.join(' + ')} only (no other metadata fields will be uploaded)")
 end
 
 # Phase 1: Collect per-locale data (don't write yet — validate first)
@@ -181,11 +190,11 @@ locales.each do |locale|
     fields: {}  # jsonc_key => value (or "description" / "whatsNew" for long text)
   }
 
-  if whats_new && !whats_new.strip.empty?
+  if (full_mode || update_whatsnew_only) && whats_new && !whats_new.strip.empty?
     entry[:fields]["whatsNew"] = whats_new
   end
 
-  unless update_whatsnew_only
+  if full_mode
     # Merge info: defaults + locale overrides (if locale dir exists)
     locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
     merged_info = defaults_info.merge(locale_info)
@@ -202,6 +211,13 @@ locales.each do |locale|
     description = locale_description || defaults_description
     if description && !description.strip.empty?
       entry[:fields]["description"] = description
+    end
+  elsif update_promotional_text_only
+    locale_info = has_locale_dir ? parse_jsonc(File.join(locale_path, "info.jsonc")) : {}
+    merged_info = defaults_info.merge(locale_info)
+    promo = merged_info["promotionalText"]
+    if promo && !promo.to_s.strip.empty?
+      entry[:fields]["promotionalText"] = promo
     end
   end
 

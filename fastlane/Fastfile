@@ -478,6 +478,22 @@ platform :ios do
       deliver_opts[:overwrite_screenshots] = true
     end
 
+    # Auto-fallback to edit_live when updating promotional text and no editable
+    # version exists. Apple allows promotional_text edits on Ready-for-Sale
+    # versions; deliver targets the draft by default and would fail otherwise.
+    if options[:update_promotional_text_only] == "true" && options[:app_version].to_s.empty?
+      app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+      UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+      if app.get_edit_app_store_version.nil?
+        UI.message(":: No editable version found — targeting the live version (edit_live: true).")
+        deliver_opts[:edit_live] = true
+        deliver_opts[:skip_screenshots] = true
+      else
+        UI.message(":: Editable version found — uploading promotional_text to the draft.")
+      end
+    end
+
     deliver(deliver_opts)
   end
 

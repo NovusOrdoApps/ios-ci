@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: true
+      update_promotional_text_only:
+        description: "Only update promotional text (Apple allows this on a Ready-for-Sale version, unlike other fields). Additive with update_whatsnew_only — when both are true, both fields are uploaded."
+        required: false
+        type: boolean
+        default: false
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -99,6 +104,7 @@ jobs:
           echo ":: App Version: ${{ inputs.app_version || '(current draft)' }}"
           echo ":: Skip Screenshots: ${{ inputs.skip_screenshots }}"
           echo ":: Update WhatsNew Only: ${{ inputs.update_whatsnew_only }}"
+          echo ":: Update Promotional Text Only: ${{ inputs.update_promotional_text_only }}"
 
       - name: Fetch active locales from App Store Connect
         id: locales
@@ -112,6 +118,7 @@ jobs:
             --output "$RUNNER_TEMP/deliver-metadata" \
             --locales "${{ steps.locales.outputs.locales }}" \
             --update-whatsnew-only "${{ inputs.update_whatsnew_only }}" \
+            --update-promotional-text-only "${{ inputs.update_promotional_text_only }}" \
             --skip-screenshots "${{ inputs.skip_screenshots }}"
 
       - name: Upload metadata to App Store Connect
@@ -121,7 +128,8 @@ jobs:
             metadata_path:"$RUNNER_TEMP/deliver-metadata/metadata" \
             screenshots_path:"$RUNNER_TEMP/deliver-metadata/screenshots" \
             skip_screenshots:"${{ inputs.skip_screenshots }}" \
-            app_version:"${{ inputs.app_version }}"
+            app_version:"${{ inputs.app_version }}" \
+            update_promotional_text_only:"${{ inputs.update_promotional_text_only }}"
 
       - name: Cleanup
         if: always()
