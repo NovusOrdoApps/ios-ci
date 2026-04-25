@@ -459,6 +459,52 @@ platform :ios do
       key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
     )
 
+    # Live-only promotional_text path: when we're updating only promotional_text
+    # and the app has no editable version, bypass `deliver` and write to the
+    # live version's localizations via the ASC API. `deliver` hangs on
+    # `fetch_edit_app_info` even with `edit_live: true` because Apple does not
+    # expose an editable AppInfo for a Ready-for-Sale-only app, so deliver is
+    # not usable for this case. Apple does allow promotional_text edits on the
+    # live AppStoreVersion's localizations directly.
+    if options[:update_promotional_text_only].to_s == "true" && options[:app_version].to_s.empty?
+      app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+      UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+      if app.get_edit_app_store_version.nil?
+        live_version = app.get_live_app_store_version(platform: "IOS")
+        UI.user_error!("No live version found on App Store Connect.") unless live_version
+
+        UI.message(":: No editable version found — updating promotional_text on live version #{live_version.version_string} via ASC API.")
+
+        by_locale = live_version.get_app_store_version_localizations.each_with_object({}) do |loc, h|
+          h[loc.locale] = loc
+        end
+
+        updated = 0
+        Dir.children(options[:metadata_path]).sort.each do |locale|
+          promo_path = File.join(options[:metadata_path], locale, "promotional_text.txt")
+          next unless File.file?(promo_path)
+          promo = File.read(promo_path).strip
+          next if promo.empty?
+
+          loc = by_locale[locale]
+          if loc.nil?
+            UI.important(":: Skipping #{locale}: no matching localization on the live version.")
+            next
+          end
+
+          loc.update(attributes: { promotional_text: promo })
+          UI.message(":: Updated promotional_text for #{locale}")
+          updated += 1
+        end
+
+        UI.success("Updated promotional_text for #{updated} locale(s) on the live version.")
+        next
+      end
+
+      UI.message(":: Editable version found — falling through to deliver.")
+    end
+
     deliver_opts = {
       api_key: api_key,
       app_identifier: ENV.fetch("APP_BUNDLE_ID"),
@@ -470,30 +516,12 @@ platform :ios do
 
     deliver_opts[:app_version] = options[:app_version] unless options[:app_version].to_s.empty?
 
-    # fastlane's CommandLineHandler coerces "true"/"false" lane args to booleans,
-    # so compare via .to_s to handle both the boolean and string forms safely.
     if options[:skip_screenshots].to_s == "true"
       deliver_opts[:skip_screenshots] = true
     else
       deliver_opts[:skip_screenshots] = false
       deliver_opts[:screenshots_path] = options[:screenshots_path]
       deliver_opts[:overwrite_screenshots] = true
-    end
-
-    # Auto-fallback to edit_live when updating promotional text and no editable
-    # version exists. Apple allows promotional_text edits on Ready-for-Sale
-    # versions; deliver targets the draft by default and would fail otherwise.
-    if options[:update_promotional_text_only].to_s == "true" && options[:app_version].to_s.empty?
-      app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-      UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
-
-      if app.get_edit_app_store_version.nil?
-        UI.message(":: No editable version found — targeting the live version (edit_live: true).")
-        deliver_opts[:edit_live] = true
-        deliver_opts[:skip_screenshots] = true
-      else
-        UI.message(":: Editable version found — uploading promotional_text to the draft.")
-      end
     end
 
     deliver(deliver_opts)
