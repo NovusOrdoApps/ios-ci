@@ -470,7 +470,9 @@ platform :ios do
 
     deliver_opts[:app_version] = options[:app_version] unless options[:app_version].to_s.empty?
 
-    if options[:skip_screenshots] == "true"
+    # fastlane's CommandLineHandler coerces "true"/"false" lane args to booleans,
+    # so compare via .to_s to handle both the boolean and string forms safely.
+    if options[:skip_screenshots].to_s == "true"
       deliver_opts[:skip_screenshots] = true
     else
       deliver_opts[:skip_screenshots] = false
@@ -481,7 +483,7 @@ platform :ios do
     # Auto-fallback to edit_live when updating promotional text and no editable
     # version exists. Apple allows promotional_text edits on Ready-for-Sale
     # versions; deliver targets the draft by default and would fail otherwise.
-    if options[:update_promotional_text_only] == "true" && options[:app_version].to_s.empty?
+    if options[:update_promotional_text_only].to_s == "true" && options[:app_version].to_s.empty?
       app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
       UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
