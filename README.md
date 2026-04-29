@@ -305,6 +305,88 @@ jobs:
 
 Uses the same App Store Connect secrets as the release workflow. Also requires the `IOS_RELEASE_APP_BUNDLE_ID` variable.
 
+## In-App Purchases
+
+A reusable workflow pair (`ios-iap.yml` + `ios-iap-sync.yml`) creates and updates consumable and non-consumable in-app purchases on App Store Connect, including localizations, price tier, and review screenshots. Re-running is safe — products are matched by `product_id`, created if missing, updated if present.
+
+### IAP folder convention
+
+```
+metadata/InAppPurchases/
+├── com.example.app.remove_ads/
+│   ├── product.jsonc            # type, reference_name, price_tier, family_shareable
+│   ├── review_screenshot.png    # optional (required only for first review submission)
+│   └── Text/
+│       ├── defaults/
+│       │   └── info.jsonc       # optional shared { name, description }
+│       ├── en/
+│       │   └── info.jsonc       # { name, description } per-locale override
+│       └── ru/
+│           └── info.jsonc
+└── com.example.app.coins_100/
+    └── ...
+```
+
+Each product folder is named after the App Store Connect `product_id`. `product.jsonc` looks like:
+
+```jsonc
+{
+  // "consumable" or "non_consumable"
+  "type": "non_consumable",
+  // Internal-only name (max 64 chars, must be unique within the app)
+  "reference_name": "Remove Ads",
+  // Apple price tier 0–87 (USA dollar value; Apple derives other territories)
+  "price_tier": 1,
+  // Only meaningful for non-consumable products
+  "family_shareable": false
+}
+```
+
+`Text/{locale}/info.jsonc` looks like:
+
+```jsonc
+{
+  "name": "Remove Ads",                // max 30 chars
+  "description": "Remove all ads."     // max 45 chars
+}
+```
+
+Field limits are enforced before upload — the transform script collects all violations across all products and locales and fails with a single report.
+
+### IAP push caller workflow
+
+```yaml
+name: Update In-App Purchases
+
+on:
+  workflow_dispatch:
+
+jobs:
+  iap:
+    uses: your-org/ios-ci/.github/workflows/ios-iap.yml@main
+    secrets: inherit
+```
+
+After upload, ios-ci attempts to transition each product to "Ready to Submit" so it ships with the next app version review. Products that don't qualify (e.g. missing review screenshot on first creation) emit a warning but don't fail the workflow.
+
+### IAP sync caller workflow
+
+```yaml
+name: Sync In-App Purchases
+
+on:
+  workflow_dispatch:
+
+jobs:
+  iap-sync:
+    uses: your-org/ios-ci/.github/workflows/ios-iap-sync.yml@main
+    secrets: inherit
+```
+
+Pulls current consumable + non-consumable products from App Store Connect into `metadata/InAppPurchases/` and opens a PR if anything changed. Like the metadata sync, fields shared across all locales are hoisted into `Text/defaults/info.jsonc`.
+
+Uses the same App Store Connect secrets as the release workflow. Also requires the `IOS_RELEASE_APP_BUNDLE_ID` variable.
+
 ## Submit for Review
 
 A third reusable workflow submits the current editable version for App Store review.
@@ -354,6 +436,8 @@ ios-ci/
 │   ├── ios-release.yml             # Reusable workflow (build + release)
 │   ├── ios-metadata.yml            # Reusable workflow (push metadata + screenshots)
 │   ├── ios-metadata-sync.yml       # Reusable workflow (pull metadata from ASC → PR)
+│   ├── ios-iap.yml                 # Reusable workflow (push in-app purchases)
+│   ├── ios-iap-sync.yml            # Reusable workflow (pull in-app purchases from ASC → PR)
 │   └── ios-submit-for-review.yml   # Reusable workflow (submit current version for review)
 ├── fastlane/
 │   ├── Fastfile                    # Lanes: signing, building, uploading, metadata
@@ -368,7 +452,9 @@ ios-ci/
     ├── generate-export-options.sh  # Builds ExportOptions.plist dynamically
     ├── transform_metadata.rb       # Transforms custom metadata format to deliver format
     ├── transform_screenshots.rb    # Validates and processes screenshots for App Store
-    └── reverse_transform_metadata.rb  # Converts deliver format to custom metadata format (for sync)
+    ├── reverse_transform_metadata.rb  # Converts deliver format to custom metadata format (for sync)
+    ├── transform_iap.rb            # Validates IAP source folder, emits normalized JSON
+    └── reverse_transform_iap.rb    # Converts ASC IAP dump back into the source layout
 ```
 
 ## Updating

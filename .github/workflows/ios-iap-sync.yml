@@ -1,0 +1,140 @@
+# Reusable workflow: Pull In-App Purchases from App Store Connect into a PR.
+#
+# Downloads consumable + non-consumable IAPs (with localizations and review
+# screenshots), converts them into the repo source layout, and opens a PR if
+# anything changed.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT (optional; falls back to GITHUB_TOKEN if repo allows write)
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS IAP Sync (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      macos_runner:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-26"
+
+concurrency:
+  group: ios-iap-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-iap:
+    name: Sync IAPs from App Store Connect
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+
+      - name: Fetch IAPs from App Store Connect
+        run: |
+          rm -rf "$RUNNER_TEMP/iap-dump"
+          (cd _ci && bundle exec fastlane fetch_iap \
+            output_path:"$RUNNER_TEMP/iap-dump")
+
+      - name: Reverse-transform into source layout
+        id: changes
+        run: |
+          if [ -d "metadata/InAppPurchases" ]; then
+            rm -rf metadata/InAppPurchases
+          fi
+          mkdir -p metadata/InAppPurchases
+
+          ruby _ci/scripts/reverse_transform_iap.rb \
+            --input "$RUNNER_TEMP/iap-dump" \
+            --output "$GITHUB_WORKSPACE/metadata/InAppPurchases"
+
+          if [ -n "$(git status --porcelain metadata/InAppPurchases/)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            git add metadata/InAppPurchases/
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo ":: No changes — repo is already in sync."
+          fi
+
+      - name: Create PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CHECKOUT_PAT || github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="iap-sync/$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git commit -m "sync: pull in-app purchases from App Store Connect"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "Sync in-app purchases from App Store Connect" \
+            --body "$(cat <<'BODY'
+          ## Summary
+
+          Pulled consumable and non-consumable IAPs from App Store Connect and
+          converted them into the repo source layout.
+
+          - Per-product folders are named after `product_id`
+          - Localization fields shared across all locales are extracted into
+            `Text/defaults/info.jsonc`; per-locale folders only keep overrides
+
+          **Review the changes and merge when ready.**
+          BODY
+          )"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
