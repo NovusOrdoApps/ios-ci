@@ -54,6 +54,11 @@ on:
         description: "Marketing version to release (e.g. '1.2.3'). Must be in semver format."
         required: true
         type: string
+      build_number:
+        description: "Optional build number override. Defaults to GITHUB_RUN_NUMBER. Must be a positive integer."
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ios-release-${{ github.repository }}-${{ github.ref }}
@@ -149,6 +154,7 @@ jobs:
         id: version_meta
         env:
           INPUT_APP_VERSION: ${{ inputs.app_version }}
+          INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
           if ! printf '%s' "$INPUT_APP_VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "ERROR: app_version must look like v1.2.3 or 1.2.3. Got '$INPUT_APP_VERSION'." >&2
@@ -158,13 +164,18 @@ jobs:
           echo "marketing_version=$VERSION" >> "$GITHUB_OUTPUT"
           echo ":: app_version='$INPUT_APP_VERSION' -> MARKETING_VERSION=$VERSION"
 
-          # Combine run number and attempt so re-runs of the same workflow
-          # produce unique, monotonically increasing build numbers. Without
-          # this, re-running a workflow whose earlier attempt already uploaded
-          # to TestFlight would fail with "bundle version already used".
-          BUILD_NUMBER=$((GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))
+          if [ -n "$INPUT_BUILD_NUMBER" ]; then
+            if ! printf '%s' "$INPUT_BUILD_NUMBER" | grep -Eq '^[1-9][0-9]*$'; then
+              echo "ERROR: build_number must be a positive integer. Got '$INPUT_BUILD_NUMBER'." >&2
+              exit 1
+            fi
+            BUILD_NUMBER="$INPUT_BUILD_NUMBER"
+            echo ":: CURRENT_PROJECT_VERSION=${BUILD_NUMBER} (explicit override)"
+          else
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+            echo ":: CURRENT_PROJECT_VERSION=${BUILD_NUMBER} (GITHUB_RUN_NUMBER)"
+          fi
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo ":: CURRENT_PROJECT_VERSION=${BUILD_NUMBER} (run #${GITHUB_RUN_NUMBER} attempt #${GITHUB_RUN_ATTEMPT})"
 
       # ── Run app-specific prepare script (if exists) ──
       # Must run BEFORE detect — some projects generate xcconfigs

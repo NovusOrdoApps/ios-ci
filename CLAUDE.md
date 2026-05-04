@@ -48,7 +48,7 @@ The release workflow is the most complex piece. It runs **detection → patch �
 8. `generate-export-options.sh` — emit `ExportOptions.plist` for AppStore and AdHoc, mapping each detected `bundle_id → "match {AppStore|AdHoc} {bundle_id}"`
 9. `fastlane install_profiles` → `set_signing` → `build_native` (or Flutter `build ipa`) → upload
 
-Build numbers use `GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT` so re-runs of a workflow whose first attempt already uploaded to TestFlight don't collide on "bundle version already used."
+Build numbers default to `GITHUB_RUN_NUMBER` (sequential, monotonic). Callers can pass an explicit `build_number` input to override. Re-runs of a workflow that already uploaded to TestFlight will collide on "bundle version already used" — start a fresh run instead, or pass an explicit `build_number`.
 
 ### Project detection contract
 
