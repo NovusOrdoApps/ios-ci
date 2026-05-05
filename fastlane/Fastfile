@@ -555,8 +555,7 @@ platform :ios do
       key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
     )
 
-    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
 
     source = JSON.parse(File.read(input_path))
     products = source.fetch("products", [])
@@ -654,8 +653,7 @@ platform :ios do
     output_path = options[:output_path] || "."
     FileUtils.mkdir_p(output_path)
 
-    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
 
     iaps = Spaceship::ConnectAPI::InAppPurchaseV2.all(app_id: app.id)
     apple_to_type = {
@@ -706,6 +704,35 @@ platform :ios do
   end
 
   # ── IAP helpers (private to update_iap / fetch_iap) ──────────
+
+  # Spaceship's App.find does a partial filter through Apple's API then an
+  # exact match in Ruby. When it returns nil, the bare error is unhelpful —
+  # the user can't tell typo vs. access vs. case mismatch. This helper
+  # surfaces what the API key can actually see so the cause is obvious.
+  def find_iap_app_or_explain!(bundle_id)
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    return app if app
+
+    hint =
+      begin
+        partial = Spaceship::ConnectAPI.get_apps(filter: { bundleId: bundle_id }).to_models
+        if partial.empty?
+          visible = Spaceship::ConnectAPI.get_apps(limit: 20).to_models.map(&:bundle_id)
+          if visible.empty?
+            "API key has access to 0 apps. Check the key's role and app access in App Store Connect."
+          else
+            "API key sees no apps matching '#{bundle_id}'. Visible bundle IDs (first 20): #{visible.join(', ')}"
+          end
+        else
+          near = partial.map(&:bundle_id).reject { |b| b == bundle_id }.uniq
+          "API returned #{partial.size} partial match(es) but none equal '#{bundle_id}'. Closest: #{near.join(', ')}"
+        end
+      rescue StandardError => e
+        "(diagnostic lookup failed: #{e.message})"
+      end
+
+    UI.user_error!("App not found: '#{bundle_id}'\n        #{hint}")
+  end
 
   def sync_iap_localizations(iap, pid, source_locs)
     existing = {}
