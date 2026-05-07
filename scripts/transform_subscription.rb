@@ -39,6 +39,11 @@ FIELD_LIMITS = {
 }.freeze
 
 VALID_PERIODS = %w[ONE_WEEK ONE_MONTH TWO_MONTHS THREE_MONTHS SIX_MONTHS ONE_YEAR].freeze
+# Apple's offer-side enums (different from base subscription period —
+# offers can also be 3-day or 2-week, which the main sub period can't be).
+VALID_OFFER_DURATIONS = %w[THREE_DAYS ONE_WEEK TWO_WEEKS ONE_MONTH TWO_MONTHS THREE_MONTHS SIX_MONTHS ONE_YEAR].freeze
+VALID_OFFER_MODES     = %w[FREE_TRIAL PAY_AS_YOU_GO PAY_UP_FRONT].freeze
+PAID_OFFER_MODES      = %w[PAY_AS_YOU_GO PAY_UP_FRONT].freeze
 
 def fail_with(errors)
   errors.each { |e| warn("ERROR: #{e}") }
@@ -271,6 +276,63 @@ group_dirs.each do |group_folder|
       errors << "#{group_folder}/#{product_id}: review_note exceeds #{FIELD_LIMITS['review_note']} chars"
     end
 
+    # Optional introductory_offers: list of offer configs. Each offer
+    # targets one or more territories. FREE_TRIAL needs no price;
+    # PAY_AS_YOU_GO + PAY_UP_FRONT both need customer_price.
+    intro_offers = sub_meta["introductory_offers"]
+    if intro_offers && !intro_offers.is_a?(Array)
+      errors << "#{group_folder}/#{product_id}: introductory_offers must be an array (got #{intro_offers.class})"
+    elsif intro_offers
+      intro_offers.each_with_index do |offer, idx|
+        path = "#{group_folder}/#{product_id}: introductory_offers[#{idx}]"
+        unless offer.is_a?(Hash)
+          errors << "#{path} must be an object"
+          next
+        end
+
+        mode = offer["offer_mode"]
+        unless VALID_OFFER_MODES.include?(mode)
+          errors << "#{path}.offer_mode must be one of #{VALID_OFFER_MODES} (got #{mode.inspect})"
+        end
+
+        dur = offer["duration"]
+        unless VALID_OFFER_DURATIONS.include?(dur)
+          errors << "#{path}.duration must be one of #{VALID_OFFER_DURATIONS} (got #{dur.inspect})"
+        end
+
+        periods = offer["number_of_periods"]
+        unless periods.is_a?(Integer) && periods >= 1
+          errors << "#{path}.number_of_periods must be a positive integer (got #{periods.inspect})"
+        end
+
+        terr = offer["territories"]
+        if terr.is_a?(String)
+          errors << "#{path}.territories string must be \"ALL\"" unless terr == "ALL"
+        elsif terr.nil? || !terr.is_a?(Array) || terr.empty?
+          errors << "#{path}.territories must be \"ALL\" or a non-empty alpha-3 array"
+        elsif terr.any? { |t| !t.is_a?(String) || !t.match?(/\A[A-Z]{3}\z/) }
+          errors << "#{path}.territories has invalid alpha-3 codes"
+        end
+
+        if PAID_OFFER_MODES.include?(mode)
+          price = offer["customer_price"]
+          unless price.is_a?(String) && price.match?(/\A\d+(\.\d{1,2})?\z/)
+            errors << "#{path}.customer_price required for #{mode}; must be a price string (got #{price.inspect})"
+          end
+        elsif mode == "FREE_TRIAL" && offer.key?("customer_price") && !offer["customer_price"].nil?
+          errors << "#{path}.customer_price must be null/absent for FREE_TRIAL"
+        end
+
+        # start_date / end_date are optional ISO date strings; loose validation.
+        %w[start_date end_date].each do |k|
+          v = offer[k]
+          if v && !(v.is_a?(String) && v.match?(/\A\d{4}-\d{2}-\d{2}\z/))
+            errors << "#{path}.#{k} must be ISO date YYYY-MM-DD or null (got #{v.inspect})"
+          end
+        end
+      end
+    end
+
     sub_localizations = collect_localizations(
       File.join(sub_path, "Text"),
       { "name" => true, "description" => true },
@@ -300,6 +362,7 @@ group_dirs.each do |group_folder|
       "available_in_new_territories" => available_in_new_territories,
       "review_screenshot"            => screenshot_path,
       "promotional_image"            => promo_image_path,
+      "introductory_offers"          => intro_offers || [],
       "localizations"                => sub_localizations,
     }
   end

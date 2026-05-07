@@ -1598,6 +1598,12 @@ platform :ios do
             warnings << "#{pid}: promotional image upload failed: #{e.message}"
           end
         end
+
+        sync_subscription_introductory_offers(
+          sub_id: sub_id, pid: pid,
+          source_offers: sub["introductory_offers"],
+          warnings: warnings,
+        )
       end
 
       # Group-level submission — submits every subscription in the
@@ -1714,6 +1720,7 @@ platform :ios do
           "territory_prices"             => territory_prices,    # {} when no overrides
           "territories"                  => territories_field,
           "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
+          "introductory_offers"          => fetch_subscription_introductory_offers(sub_id: sub["id"]),
         }
         File.write(File.join(sub_dir, "subscription.json"), JSON.pretty_generate(meta))
 
@@ -2155,9 +2162,11 @@ platform :ios do
       }
     })
   rescue Spaceship::UnexpectedResponse => e
-    raise unless e.message =~ /already exists/i
     # Apple holds at most one promotional image per sub via this lane.
-    # To replace, delete via ASC UI first (replacement-via-API is v2).
+    # Multiple wordings observed: "already exists" / "Cannot create new
+    # image, there is an existing image". Catch both. To replace,
+    # delete via ASC UI first (replacement-via-API is v2).
+    raise unless e.message =~ /already exists|existing image/i
   end
 
   # GET /v1/subscriptions/<id>/images — downloads the FIRST image
@@ -2179,6 +2188,151 @@ platform :ios do
       File.open(dest_path, "wb") { |f| f.write(io.read) }
     end
     url
+  end
+
+  # GET /v1/subscriptions/<id>/introductoryOffers
+  # Returns the raw resource array (relationships expanded into
+  # `included` for territory + price point — same JSON:API pattern
+  # as the price helpers).
+  def list_subscription_introductory_offers(sub_id:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/introductoryOffers", {
+      "include" => "territory,subscriptionPricePoint",
+      "limit"   => 200,
+    }).body
+    {
+      "data"     => resp["data"]     || [],
+      "included" => resp["included"] || [],
+    }
+  end
+
+  # POST /v1/subscriptionIntroductoryOffers
+  # FREE_TRIAL doesn't take a price point. PAY_AS_YOU_GO and
+  # PAY_UP_FRONT require one (the discounted price for the intro
+  # period). startDate/endDate are optional — null means
+  # "effective immediately, no expiration".
+  def create_subscription_introductory_offer(sub_id:, offer_mode:, duration:, number_of_periods:,
+                                             territory: nil, start_date: nil, end_date: nil,
+                                             price_point_id: nil)
+    attrs = {
+      offerMode:       offer_mode,
+      duration:        duration,
+      numberOfPeriods: number_of_periods,
+    }
+    attrs[:startDate] = start_date if start_date
+    attrs[:endDate]   = end_date   if end_date
+
+    rels = { subscription: { data: { type: "subscriptions", id: sub_id } } }
+    rels[:territory]              = { data: { type: "territories",              id: territory      } } if territory
+    rels[:subscriptionPricePoint] = { data: { type: "subscriptionPricePoints",  id: price_point_id } } if price_point_id
+
+    iap_client.post("v1/subscriptionIntroductoryOffers", {
+      data: { type: "subscriptionIntroductoryOffers", attributes: attrs, relationships: rels }
+    })
+  end
+
+  # Orchestrator: takes the source list of intro offers and POSTs each
+  # per (territory) tuple. "ALL" expands to Apple's territory list.
+  # Additive: existing offers are NOT removed (Apple needs explicit
+  # DELETE per offer; v2 feature). On 409 "already exists", silently
+  # skip — that combination is already in place.
+  def sync_subscription_introductory_offers(sub_id:, pid:, source_offers:, warnings:)
+    return if source_offers.nil? || source_offers.empty?
+
+    paid_modes = %w[PAY_AS_YOU_GO PAY_UP_FRONT].freeze
+
+    source_offers.each_with_index do |offer, idx|
+      mode      = offer.fetch("offer_mode")
+      duration  = offer.fetch("duration")
+      periods   = offer.fetch("number_of_periods")
+      start_d   = offer["start_date"]
+      end_d     = offer["end_date"]
+      price     = offer["customer_price"]
+      terr_in   = offer["territories"]
+
+      territories = case terr_in
+                    when "ALL"
+                      fetch_all_apple_territories
+                    when Array
+                      terr_in
+                    else
+                      [terr_in].compact
+                    end
+
+      if territories.empty?
+        warnings << "#{pid}: introductory_offers[#{idx}] has no territories; skipping"
+        next
+      end
+
+      territories.each do |territory|
+        begin
+          point_id = nil
+          if paid_modes.include?(mode)
+            point_id = fetch_subscription_price_point_id(
+              sub_id: sub_id, customer_price: price, territory: territory
+            )
+          end
+          create_subscription_introductory_offer(
+            sub_id:            sub_id,
+            offer_mode:        mode,
+            duration:          duration,
+            number_of_periods: periods,
+            territory:         territory,
+            start_date:        start_d,
+            end_date:          end_d,
+            price_point_id:    point_id,
+          )
+        rescue Spaceship::UnexpectedResponse => e
+          if e.message =~ /already exists|conflict/i
+            # Same offer already configured for (sub, territory) — skip silently.
+          else
+            warnings << "#{pid}: intro offer (#{mode}/#{duration}×#{periods}/#{territory}) failed: #{e.message}"
+          end
+        rescue StandardError => e
+          warnings << "#{pid}: intro offer (#{mode}/#{duration}×#{periods}/#{territory}) failed: #{e.message}"
+        end
+      end
+    end
+  end
+
+  # Reverse: collapse Apple's per-territory rows back into the source
+  # shape (one entry per (mode, duration, periods, price), with
+  # `territories` rolled up — uses "ALL" sentinel when the set ==
+  # canonical territories list).
+  def fetch_subscription_introductory_offers(sub_id:)
+    listed = list_subscription_introductory_offers(sub_id: sub_id)
+    point_prices = listed["included"]
+      .select { |x| x["type"] == "subscriptionPricePoints" }
+      .each_with_object({}) { |x, h| h[x["id"]] = x.dig("attributes", "customerPrice") }
+
+    grouped = Hash.new { |h, k| h[k] = { config: nil, territories: [] } }
+    listed["data"].each do |row|
+      attrs = row["attributes"] || {}
+      mode  = attrs["offerMode"]
+      pp_id = row.dig("relationships", "subscriptionPricePoint", "data", "id")
+      terr  = row.dig("relationships", "territory", "data", "id")
+      price = pp_id ? point_prices[pp_id] : nil
+
+      key = [mode, attrs["duration"], attrs["numberOfPeriods"], price, attrs["startDate"], attrs["endDate"]]
+      bucket = grouped[key]
+      bucket[:config] ||= {
+        "offer_mode"        => mode,
+        "duration"          => attrs["duration"],
+        "number_of_periods" => attrs["numberOfPeriods"],
+        "customer_price"    => price,                      # nil for FREE_TRIAL
+        "start_date"        => attrs["startDate"],
+        "end_date"          => attrs["endDate"],
+      }
+      bucket[:territories] << terr if terr
+    end
+
+    all_apple = nil
+    grouped.values.map do |bucket|
+      sorted_terr = bucket[:territories].uniq.sort
+      all_apple ||= fetch_all_apple_territories
+      bucket[:config].merge(
+        "territories" => (sorted_terr.size == all_apple.size && sorted_terr == all_apple) ? "ALL" : sorted_terr
+      )
+    end
   end
 
   # POST /v1/subscriptionGroupSubmissions — submits the WHOLE GROUP
