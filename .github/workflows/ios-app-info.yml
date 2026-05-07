@@ -1,8 +1,15 @@
-# Reusable workflow: Push custom End User License Agreement for one app.
+# Reusable workflow: Push consolidated App Information page fields
+# (accessibility URL, subscription status URLs, content rights, EULA)
+# from a single metadata/AppInfo/app_info.jsonc file.
 #
-# Reads the caller repo's metadata/AppInfo/eula.jsonc.
-# Idempotent: territory list immutable post-create, so any territory
-# change forces DELETE + POST. Text-only changes are PATCHed.
+# Each section is optional — the lane only touches sections present
+# in the file. Idempotent: only PATCHes when state diverges.
+#
+# Replaces ios-accessibility.yml + ios-eula.yml + ios-subscription-status-url.yml.
+# Out of scope (separate lanes / not yet implemented):
+#   - Accessibility declarations (per-deviceFamily matrix)
+#   - Age rating questionnaire
+#   - Per-locale fields (privacy_url, name, subtitle) — handled by metadata pipeline
 #
 # Required repo secrets:
 #   APP_STORE_CONNECT_API_KEY_P8
@@ -15,16 +22,16 @@
 # Required repo variables:
 #   IOS_RELEASE_APP_BUNDLE_ID
 
-name: iOS EULA (Reusable)
+name: iOS App Info (Reusable)
 
 on:
   workflow_call:
     inputs:
       input_path:
-        description: "Path (relative to caller repo root) to eula.jsonc"
+        description: "Path (relative to caller repo root) to app_info.jsonc"
         required: false
         type: string
-        default: "metadata/AppInfo/eula.jsonc"
+        default: "metadata/AppInfo/app_info.jsonc"
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -37,12 +44,12 @@ on:
         default: "macos-26"
 
 concurrency:
-  group: ios-eula-${{ github.repository }}-${{ github.ref }}
+  group: ios-app-info-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  update-eula:
-    name: Update Custom EULA
+  update-app-info:
+    name: Update App Information fields
     runs-on: ${{ inputs.macos_runner }}
     timeout-minutes: 15
 
@@ -81,18 +88,18 @@ jobs:
           : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
 
           if [ ! -f "${{ inputs.input_path }}" ]; then
-            echo ":: ${{ inputs.input_path }} not found — nothing to do (no custom EULA configured)"
+            echo ":: ${{ inputs.input_path }} not found — nothing to do (no app info configured)"
             echo "SKIP_RUN=1" >> "$GITHUB_ENV"
           fi
 
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
           echo ":: Input path: ${{ inputs.input_path }}"
 
-      - name: Push EULA to App Store Connect
+      - name: Push App Info to App Store Connect
         if: env.SKIP_RUN != '1'
         working-directory: _ci
         run: |
-          bundle exec fastlane update_eula \
+          bundle exec fastlane update_app_info \
             input_path:"$GITHUB_WORKSPACE/${{ inputs.input_path }}"
 
       - name: Cleanup

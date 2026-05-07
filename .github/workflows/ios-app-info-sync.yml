@@ -1,0 +1,129 @@
+# Reusable workflow: Pull App Information page fields from App Store
+# Connect into a PR. Reads accessibilityUrl, subscriptionStatusUrl pair,
+# contentRightsDeclaration, and any custom EULA, then writes a
+# unified app_info.jsonc back to metadata/AppInfo/.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT (optional; falls back to GITHUB_TOKEN)
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS App Info Sync (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      macos_runner:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-26"
+
+concurrency:
+  group: ios-app-info-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-app-info:
+    name: Sync App Info from App Store Connect
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+
+      - name: Fetch App Info from App Store Connect
+        run: |
+          rm -rf "$RUNNER_TEMP/app-info-dump"
+          mkdir -p "$RUNNER_TEMP/app-info-dump"
+          (cd _ci && bundle exec fastlane fetch_app_info \
+            output_path:"$RUNNER_TEMP/app-info-dump")
+
+      - name: Convert dump to jsonc + detect changes
+        id: changes
+        run: |
+          mkdir -p metadata/AppInfo
+
+          # fetch_app_info writes app_info.json; we keep it as .jsonc in the
+          # source layout. Pretty-print into the destination.
+          ruby -r json -e '
+            data = JSON.parse(File.read(ENV["DUMP"] + "/app_info.json"))
+            File.write(ENV["DEST"], JSON.pretty_generate(data) + "\n")
+          ' || true
+        env:
+          DUMP: ${{ runner.temp }}/app-info-dump
+          DEST: metadata/AppInfo/app_info.jsonc
+
+      - name: Detect changes + create PR
+        env:
+          GH_TOKEN: ${{ secrets.CHECKOUT_PAT || github.token }}
+        run: |
+          if [ -n "$(git status --porcelain metadata/AppInfo/app_info.jsonc)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            BRANCH="app-info-sync/$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$BRANCH"
+            git add metadata/AppInfo/app_info.jsonc
+            git commit -m "sync: pull app info from App Store Connect"
+            git push -u origin "$BRANCH"
+
+            gh pr create \
+              --title "Sync App Info from App Store Connect" \
+              --body "Pulled accessibility URL, subscription status URLs, content rights, and custom EULA from App Store Connect into a unified app_info.jsonc.
+
+          **Review the changes and merge when ready.**"
+          else
+            echo ":: No changes — repo is already in sync."
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
