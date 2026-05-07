@@ -718,6 +718,67 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # register_bundle_id
+  #
+  # Register a bundle ID in the Apple Developer portal via the public
+  # ASC REST API: POST /v1/bundleIds. Idempotent — looks for an
+  # existing bundle ID with the same identifier first; only POSTs if
+  # absent. Returns the bundle ID's opaque resource ID via lane_context.
+  #
+  # Required for any new app whose bundle ID hasn't been registered
+  # yet — bundle IDs registered in the Developer portal automatically
+  # appear in App Store Connect's bundle ID dropdown, which the
+  # asc-ops-workflow `create_app` lane consumes.
+  #
+  # Usage: bundle exec fastlane register_bundle_id \
+  #          identifier:com.example.myapp \
+  #          name:"My Awesome App" \
+  #          platform:UNIVERSAL
+  # ──────────────────────────────────────────────
+  lane :register_bundle_id do |options|
+    require "spaceship"
+
+    identifier = options[:identifier] || ENV["APP_BUNDLE_ID"]
+    UI.user_error!("Missing identifier (or APP_BUNDLE_ID env)") if identifier.to_s.empty?
+
+    name = options[:name] || identifier
+    platform = options[:platform] || "UNIVERSAL"   # IOS | MAC_OS | UNIVERSAL
+
+    UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS | UNIVERSAL") \
+      unless %w[IOS MAC_OS UNIVERSAL].include?(platform)
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    client = Spaceship::ConnectAPI::Provisioning.client
+
+    # Look for existing bundle ID by identifier (idempotency)
+    existing_resp = client.get("v1/bundleIds", { "filter[identifier]" => identifier, "limit" => 1 })
+    existing = existing_resp.body["data"]&.first
+
+    if existing
+      UI.success(":: Bundle ID already exists: #{identifier} → #{existing['id']}")
+      lane_context[SharedValues::REGISTER_BUNDLE_ID_RESOURCE_ID] = existing["id"] if defined?(SharedValues)
+      next existing["id"]
+    end
+
+    # POST a new one
+    resp = client.post("v1/bundleIds", {
+      data: {
+        type: "bundleIds",
+        attributes: { identifier: identifier, name: name, platform: platform },
+      }
+    })
+
+    new_id = resp.body.dig("data", "id")
+    UI.success(":: Registered bundle ID #{identifier} → #{new_id}")
+    new_id
+  end
+
+  # ──────────────────────────────────────────────
   # update_data_usages
   #
   # Push App Privacy "Data Usage" disclosures (the privacy nutrition

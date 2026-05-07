@@ -1,0 +1,92 @@
+# Reusable workflow: Register a bundle ID in the Apple Developer portal
+# via POST /v1/bundleIds (REST + JWT). Idempotent — no-op if already
+# registered.
+#
+# Required for new apps; the registered bundle ID auto-appears in App
+# Store Connect's bundle ID dropdown for `create_app` to consume.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT
+
+name: iOS Register Bundle ID (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      identifier:
+        description: "Bundle ID (reverse-DNS, e.g. com.example.myapp)"
+        required: true
+        type: string
+      name:
+        description: "Display name in Developer portal (defaults to identifier)"
+        required: false
+        type: string
+        default: ""
+      platform:
+        description: "Platform: IOS | MAC_OS | UNIVERSAL"
+        required: false
+        type: string
+        default: "UNIVERSAL"
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      macos_runner:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-26"
+
+concurrency:
+  group: ios-register-bundle-id-${{ github.repository }}-${{ inputs.identifier }}
+  cancel-in-progress: false
+
+jobs:
+  register:
+    name: Register Bundle ID
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 10
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+    steps:
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Register bundle ID
+        working-directory: _ci
+        run: |
+          NAME="${{ inputs.name }}"
+          [ -z "$NAME" ] && NAME="${{ inputs.identifier }}"
+          bundle exec fastlane register_bundle_id \
+            identifier:"${{ inputs.identifier }}" \
+            name:"$NAME" \
+            platform:"${{ inputs.platform }}"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
