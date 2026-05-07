@@ -587,6 +587,21 @@ platform :ios do
     end
     UI.message(":: App has #{existing.size} existing IAP(s) on ASC")
 
+    # Detect first-version vs subsequent. Apple's two paths:
+    #   - First version (no live version): IAPs MUST be reviewed alongside
+    #     v1 — this lane should NOT submit independently. Leave items in
+    #     READY_TO_SUBMIT for the iris attach lane (asc-ops-workflow's
+    #     attach_in_app_items_to_next_version) to bundle with the v1
+    #     submission via submit.yml.
+    #   - Subsequent version (has live version): IAPs can be reviewed
+    #     independently. Auto-submit (existing behavior). Apple's web UI
+    #     doesn't even show the version-attach picker for v2+ since it
+    #     defaults to independent review.
+    has_live_version = !app.get_live_app_store_version.nil?
+    auto_submit = has_live_version
+    UI.message(":: Auto-submit IAPs: #{auto_submit} (live version exists: #{has_live_version}). " \
+               "When false, IAPs are left in READY_TO_SUBMIT for attach-to-first-version flow.")
+
     warnings = []
 
     products.each do |product|
@@ -659,10 +674,15 @@ platform :ios do
         end
       end
 
-      begin
-        submit_iap_for_review(iap_id: iap_id)
-      rescue StandardError => e
-        warnings << "#{pid}: transition to 'Ready to Submit' failed: #{e.message}"
+      if auto_submit
+        begin
+          submit_iap_for_review(iap_id: iap_id)
+        rescue StandardError => e
+          warnings << "#{pid}: independent submission failed: #{e.message}"
+        end
+      else
+        UI.message(":: #{pid}: skipping independent submit (no live version). " \
+                   "Will be attached to v1 review by asc-ops-workflow's attach_in_app_items_to_next_version lane (run via submit.yml).")
       end
     end
 
@@ -1492,6 +1512,13 @@ platform :ios do
     end
     UI.message(":: App has #{existing_groups.size} existing subscription group(s) on ASC")
 
+    # First-version vs subsequent split, same logic as update_iap.
+    # First version (no live version) → don't auto-submit; iris attach
+    # lane bundles into v1 review. Subsequent → auto-submit independent.
+    has_live_version = !app.get_live_app_store_version.nil?
+    auto_submit = has_live_version
+    UI.message(":: Auto-submit subscription groups: #{auto_submit} (live version exists: #{has_live_version})")
+
     warnings = []
 
     groups.each do |group|
@@ -1618,17 +1645,22 @@ platform :ios do
         )
       end
 
-      # Group-level submission — submits every subscription in the
-      # group at once. Best-effort; subscriptions sit in
-      # MISSING_METADATA until Apple validates everything (which can
-      # take some time even after we've set price/availability/
-      # screenshot/localizations). If the submission errors here,
-      # re-running the workflow later usually succeeds.
-      begin
-        submit_subscription_group_for_review(group_id: group_id)
-        UI.success(":: Submitted group '#{ref}' for review")
-      rescue StandardError => e
-        warnings << "group '#{ref}': submission deferred — #{e.message}. Re-run after subs reach READY_TO_SUBMIT."
+      # Group-level submission — same first-vs-subsequent split as IAPs.
+      # First version (no live version): leave in READY_TO_SUBMIT for
+      # iris attach lane to bundle with v1 review.
+      # Subsequent version: independent submission (mirrors Apple's
+      # web UI behavior for v2+ where the version-attach picker is
+      # not shown).
+      if auto_submit
+        begin
+          submit_subscription_group_for_review(group_id: group_id)
+          UI.success(":: Submitted group '#{ref}' for independent review")
+        rescue StandardError => e
+          warnings << "group '#{ref}': independent submission deferred — #{e.message}. Re-run after subs reach READY_TO_SUBMIT."
+        end
+      else
+        UI.message(":: group '#{ref}': skipping independent submit (no live version). " \
+                   "Will be attached to v1 review by asc-ops-workflow's attach_in_app_items_to_next_version lane (run via submit.yml).")
       end
     end
 
