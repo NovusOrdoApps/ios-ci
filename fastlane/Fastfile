@@ -635,9 +635,14 @@ platform :ios do
 
       if product["territories"]
         begin
+          # "ALL" sentinel expands to Apple's canonical territory list
+          # (live, so newly-added territories get picked up automatically
+          # without bumping a hardcoded snapshot in this repo).
+          territories = product["territories"]
+          territories = fetch_all_apple_territories if territories == "ALL"
           sync_iap_availability(
             iap_id: iap_id,
-            territories: product["territories"],
+            territories: territories,
             available_in_new_territories: product.fetch("available_in_new_territories", true)
           )
         rescue StandardError => e
@@ -712,12 +717,18 @@ platform :ios do
       family_sharable = false if family_sharable.nil?
 
       availability = fetch_iap_availability(iap_id: iap["id"]) || {}
+      territories = availability["territories"] || []
+      # Compress to the "ALL" sentinel when the IAP is sold in every
+      # Apple-supported territory — keeps synced PRs readable instead
+      # of dumping 175 alpha-3 codes into the diff.
+      all_apple = fetch_all_apple_territories
+      territories_field = (territories.size == all_apple.size && territories == all_apple) ? "ALL" : territories
 
       meta = {
         "type"                         => type,
         "reference_name"               => iap.dig("attributes", "name"),
         "customer_price"               => fetch_iap_price_tier(iap_id: iap["id"]),
-        "territories"                  => availability["territories"] || [],
+        "territories"                  => territories_field,
         "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
         "family_shareable"             => family_sharable,
       }
@@ -1245,32 +1256,51 @@ platform :ios do
     # Already set — no-op
   end
 
+  # Apple's canonical alpha-3 territory list (~175). Cached per
+  # lane invocation. Used both to expand the "ALL" sentinel on push
+  # and to recognize an "all-territories" availability on sync (so we
+  # can compress 175 entries back into "ALL" in the synced PR).
+  # /v1/territories caps limit at 200 — fits all current territories.
+  def fetch_all_apple_territories
+    @all_apple_territories ||= begin
+      resp = iap_client.get("v1/territories", { "limit" => 200 }).body
+      (resp["data"] || []).map { |x| x["id"] }.uniq.sort
+    end
+  end
+
   # Reads the IAP's current availability — territory list +
   # availableInNewTerritories flag — for the sync direction.
-  # GET /v2/inAppPurchases/<id>/inAppPurchaseAvailability with
-  # ?include=availableTerritories. Apple caps the page size at 50, so
-  # we follow the JSON:API `links.next` cursor until exhausted.
+  #
+  # Two-step:
+  #   1. GET /v2/inAppPurchases/<id>/inAppPurchaseAvailability
+  #      → availability resource id + availableInNewTerritories
+  #   2. GET /v1/inAppPurchaseAvailabilities/<aid>/availableTerritories?limit=200
+  #      → full territory list in one shot (Apple has ~175 territories)
+  #
+  # The earlier "?include=availableTerritories" approach was capped at
+  # 50 by Apple regardless of limit param — pagination of *included*
+  # resources is not standard JSON:API and Apple's behavior was to
+  # silently truncate. The dedicated availableTerritories endpoint
+  # paginates correctly.
+  #
   # Returns { "territories" => [<alpha3>, ...], "available_in_new_territories" => bool }
   # or nil if Apple has no availability resource for this IAP.
   def fetch_iap_availability(iap_id:)
-    resp = iap_client.get("v2/inAppPurchases/#{iap_id}/inAppPurchaseAvailability",
-                          { "include" => "availableTerritories", "limit[availableTerritories]" => 50 }).body
+    resp = iap_client.get("v2/inAppPurchases/#{iap_id}/inAppPurchaseAvailability").body
     return nil unless resp["data"]
 
-    territories = (resp["included"] || [])
-      .select { |x| x["type"] == "territories" }
-      .map { |x| x["id"] }
+    avail_id = resp.dig("data", "id")
+    flag = resp.dig("data", "attributes", "availableInNewTerritories")
 
-    next_url = resp.dig("data", "relationships", "availableTerritories", "links", "next")
-    while next_url
-      page = iap_client.get(next_url).body
-      territories.concat((page["data"] || []).map { |x| x["id"] })
-      next_url = page.dig("links", "next")
-    end
+    terr_resp = iap_client.get(
+      "v1/inAppPurchaseAvailabilities/#{avail_id}/availableTerritories",
+      { "limit" => 200 }
+    ).body
+    territories = (terr_resp["data"] || []).map { |x| x["id"] }.uniq.sort
 
     {
-      "territories"                  => territories.uniq.sort,
-      "available_in_new_territories" => resp.dig("data", "attributes", "availableInNewTerritories"),
+      "territories"                  => territories,
+      "available_in_new_territories" => flag,
     }
   rescue Spaceship::UnexpectedResponse => e
     return nil if e.message =~ /404|not found/i
