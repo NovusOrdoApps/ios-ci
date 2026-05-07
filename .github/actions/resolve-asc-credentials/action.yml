@@ -10,7 +10,10 @@ description: >-
     0 environments  → Class 1 → use repo secrets fallbacks
     1 environment   → Class 2 → that environment's name IS the team_slug
                                 → checkout vault, read team's API key + team_id
-    2+ environments → caller MUST pass `team_slug` input explicitly
+    2+ environments → Class 2 → preselect alphabetically first (typical for
+                                dev/staging/prod splits where you want a
+                                deterministic default). Override via the
+                                `team_slug` input when the default is wrong.
 
   Class 1 fallbacks expected as inputs:
     fallback_p8        — APP_STORE_CONNECT_API_KEY_P8 secret value
@@ -82,9 +85,12 @@ runs:
           exit 0
         fi
 
-        # Auto-detect via Environments listing on the caller repo.
-        envs_json=$(gh api "repos/$GITHUB_REPOSITORY/environments" --jq '.environments[].name' 2>/dev/null || true)
-        env_count=$(echo "$envs_json" | grep -c . || true)
+        # Auto-detect via Environments listing on the caller repo. Sorted
+        # alphabetically for determinism — the FIRST one wins when multiple
+        # exist (typical dev/staging/prod naming sorts in that order if the
+        # operator follows convention; otherwise pass team_slug explicitly).
+        envs_sorted=$(gh api "repos/$GITHUB_REPOSITORY/environments" --jq '.environments[].name' 2>/dev/null | sort || true)
+        env_count=$(echo "$envs_sorted" | grep -c . || true)
 
         case "$env_count" in
           0)
@@ -93,14 +99,18 @@ runs:
             echo ":: Class 1 (no Environments → use repo secrets)"
             ;;
           1)
-            slug=$(echo "$envs_json" | tr -d '[:space:]')
+            slug=$(echo "$envs_sorted" | tr -d '[:space:]')
             echo "team_slug=$slug"       >> "$GITHUB_OUTPUT"
             echo "class=class2"          >> "$GITHUB_OUTPUT"
             echo ":: Class 2 (Environment '$slug' → vault)"
             ;;
           *)
-            echo "::error::Multiple GitHub Environments found ($env_count). Pass 'team_slug' input explicitly to disambiguate. Detected: $envs_json"
-            exit 1
+            slug=$(echo "$envs_sorted" | head -1 | tr -d '[:space:]')
+            others=$(echo "$envs_sorted" | tail -n +2 | tr '\n' ',' | sed 's/,$//')
+            echo "team_slug=$slug"       >> "$GITHUB_OUTPUT"
+            echo "class=class2"          >> "$GITHUB_OUTPUT"
+            echo "::warning::Multiple Environments found ($env_count). Auto-selected '$slug' (alphabetically first). Other Environments ignored: $others. Pass team_slug input to override."
+            echo ":: Class 2 (Environment '$slug' → vault, auto-selected from $env_count)"
             ;;
         esac
 
