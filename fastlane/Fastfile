@@ -620,10 +620,29 @@ platform :ios do
       iap_id = iap["id"]
       sync_iap_localizations(iap_id: iap_id, pid: pid, source_locs: product.fetch("localizations"))
 
-      begin
-        sync_iap_price(iap_id: iap_id, tier: product.fetch("price_tier"))
-      rescue StandardError => e
-        warnings << "#{pid}: price update failed: #{e.message}"
+      # Price: accept "customer_price" (USD string, e.g. "0.99") OR legacy
+      # "price_tier" key for back-compat (treat as USD price for now;
+      # apps that need true legacy-tier-1-to-100 mapping should switch
+      # to customer_price).
+      desired_price = product["customer_price"] || product["price_tier"]
+      if desired_price
+        begin
+          sync_iap_price(iap_id: iap_id, customer_price: desired_price)
+        rescue StandardError => e
+          warnings << "#{pid}: price update failed: #{e.message}"
+        end
+      end
+
+      if product["territories"]
+        begin
+          sync_iap_availability(
+            iap_id: iap_id,
+            territories: product["territories"],
+            available_in_new_territories: product.fetch("available_in_new_territories", true)
+          )
+        rescue StandardError => e
+          warnings << "#{pid}: availability update failed: #{e.message}"
+        end
       end
 
       if product["review_screenshot"]
@@ -695,7 +714,7 @@ platform :ios do
       meta = {
         "type"             => type,
         "reference_name"   => iap.dig("attributes", "name"),
-        "price_tier"       => fetch_iap_price_tier(iap_id: iap["id"]),
+        "customer_price"   => fetch_iap_price_tier(iap_id: iap["id"]),
         "family_shareable" => family_sharable,
       }
       File.write(File.join(product_dir, "product.json"), JSON.pretty_generate(meta))
@@ -1154,52 +1173,156 @@ platform :ios do
     end
   end
 
-  # Apple's V2 IAP pricing uses price points, not raw tier numbers.
-  # The shape was not fully reconned for V2 in this rewrite — leaving
-  # as best-effort. Existing call sites already wrap in rescue so a
-  # raise here is logged as a warning and the rest of the lane continues.
-  def sync_iap_price(iap_id:, tier:)
-    raise "IAP price-tier sync not yet implemented for V2 endpoints (TODO: recon /v2/iapPriceSchedules); requested tier=#{tier}, IAP id=#{iap_id}"
+  # Apple's IAP V2 pricing uses price points (no legacy tier numbers).
+  # POST /v1/inAppPurchasePriceSchedules with the price-point ID for the
+  # desired customerPrice in baseTerritory. JWT-verified 2026-05-07.
+  # POST replaces the existing schedule (no DELETE needed); each
+  # schedule's id == its IAP's id.
+  def sync_iap_price(iap_id:, customer_price:, base_territory: "USA")
+    cp = customer_price.to_s
+    page = iap_client.get(
+      "v2/inAppPurchases/#{iap_id}/pricePoints",
+      { "filter[territory]" => base_territory, "limit" => 1000 }
+    ).body
+    point = (page["data"] || []).find { |p| p.dig("attributes", "customerPrice") == cp }
+    raise "no price point found in #{base_territory} for customerPrice=#{cp.inspect}" unless point
+
+    iap_client.post("v1/inAppPurchasePriceSchedules", {
+      data: {
+        type: "inAppPurchasePriceSchedules",
+        attributes: {},
+        relationships: {
+          inAppPurchase: { data: { type: "inAppPurchases", id: iap_id } },
+          baseTerritory: { data: { type: "territories", id: base_territory } },
+          manualPrices:  { data: [{ type: "inAppPurchasePrices", id: "${newprice-0}" }] },
+        }
+      },
+      included: [{
+        id: "${newprice-0}",
+        type: "inAppPurchasePrices",
+        attributes: { startDate: nil },
+        relationships: {
+          inAppPurchasePricePoint: { data: { type: "inAppPurchasePricePoints", id: point["id"] } }
+        }
+      }]
+    })
   end
 
+  # Returns the customerPrice (USD string, e.g. "0.99") for the
+  # base-territory manual price, or nil if no schedule exists.
   def fetch_iap_price_tier(iap_id:)
-    # TODO: GET /v1/inAppPurchases/<id>/iapPriceSchedule then derive tier
-    # from price point. Return nil for now so reverse_transform doesn't
-    # bail on missing tier.
-    nil
+    resp = iap_client.get("v1/inAppPurchasePriceSchedules/#{iap_id}/manualPrices",
+                          { "include" => "inAppPurchasePricePoint", "limit" => 10 }).body
+    point_ref = (resp["data"] || []).first&.dig("relationships", "inAppPurchasePricePoint", "data", "id")
+    return nil unless point_ref
+    point = (resp["included"] || []).find { |x| x["type"] == "inAppPurchasePricePoints" && x["id"] == point_ref }
+    point&.dig("attributes", "customerPrice")
   rescue StandardError
     nil
   end
 
+  # Apple's IAP availability — which territories the IAP is sold in.
+  # POST /v1/inAppPurchaseAvailabilities. JWT-verified 2026-05-07.
+  # Idempotent at the OpenAPI level but Apple may 409 if one already
+  # exists; we treat that as no-op.
+  def sync_iap_availability(iap_id:, territories:, available_in_new_territories: true)
+    iap_client.post("v1/inAppPurchaseAvailabilities", {
+      data: {
+        type: "inAppPurchaseAvailabilities",
+        attributes: { availableInNewTerritories: available_in_new_territories },
+        relationships: {
+          inAppPurchase: { data: { type: "inAppPurchases", id: iap_id } },
+          availableTerritories: { data: territories.map { |t| { type: "territories", id: t } } }
+        }
+      }
+    })
+  rescue Spaceship::UnexpectedResponse => e
+    raise unless e.message =~ /already exists|cannot create another/i
+    # Already set — no-op
+  end
+
+  # 3-step Apple asset upload pattern. JWT-verified 2026-05-07.
+  #   1. POST /v1/inAppPurchaseAppStoreReviewScreenshots with fileSize+fileName
+  #      → response includes uploadOperations array (URL+headers+offset+length)
+  #   2. Execute each upload operation (PUT bytes to returned URL)
+  #   3. PATCH the screenshot resource with sourceFileChecksum (MD5) +
+  #      uploaded:true to commit
   def upload_iap_review_screenshot(iap_id:, path:)
+    require "digest"
+    require "net/http"
+    require "uri"
     raise "screenshot file not found: #{path}" unless File.file?(path)
-    # TODO: V2 review screenshot upload requires a multi-step flow
-    # (POST appStoreReviewScreenshot → upload bytes to returned asset URL
-    # → commit). Not yet reconned. Caller wraps in rescue.
-    raise "IAP review screenshot upload not yet implemented for V2 endpoints"
+
+    bytes = File.binread(path)
+    file_size = bytes.bytesize
+    file_name = File.basename(path)
+    checksum = Digest::MD5.hexdigest(bytes)
+
+    create = iap_client.post("v1/inAppPurchaseAppStoreReviewScreenshots", {
+      data: {
+        type: "inAppPurchaseAppStoreReviewScreenshots",
+        attributes: { fileSize: file_size, fileName: file_name },
+        relationships: { inAppPurchaseV2: { data: { type: "inAppPurchases", id: iap_id } } }
+      }
+    })
+    ss_id = create.body.dig("data", "id")
+    ops = create.body.dig("data", "attributes", "uploadOperations") || []
+
+    ops.each do |op|
+      url = URI(op["url"])
+      http = Net::HTTP.new(url.host, url.port)
+      http.use_ssl = url.scheme == "https"
+      req_class = Net::HTTP.const_get((op["method"] || "PUT").capitalize)
+      req = req_class.new(url.request_uri)
+      (op["requestHeaders"] || []).each { |h| req[h["name"]] = h["value"] }
+      req.body = bytes.byteslice(op["offset"].to_i, op["length"].to_i)
+      resp = http.request(req)
+      raise "screenshot upload PUT failed: #{resp.code} #{resp.body}" unless resp.code.to_i.between?(200, 299)
+    end
+
+    iap_client.patch("v1/inAppPurchaseAppStoreReviewScreenshots/#{ss_id}", {
+      data: {
+        type: "inAppPurchaseAppStoreReviewScreenshots",
+        id: ss_id,
+        attributes: { uploaded: true, sourceFileChecksum: checksum }
+      }
+    })
+    ss_id
   end
 
   def download_iap_review_screenshot(iap_id:, dest_path:)
-    # TODO: GET /v2/inAppPurchases/<id>/appStoreReviewScreenshot, parse
-    # the asset URL, download bytes. Not yet reconned. fetch_iap wraps
-    # this in rescue so missing implementation = silent skip.
+    require "open-uri"
+    asset = iap_client.get("v2/inAppPurchases/#{iap_id}/appStoreReviewScreenshot")
+                      .body.dig("data", "attributes", "imageAsset")
+    return unless asset && asset["templateUrl"]
+    width  = asset["width"]  || 640
+    height = asset["height"] || 920
+    url = asset["templateUrl"].gsub("{w}", width.to_s).gsub("{h}", height.to_s).gsub("{c}", "bb").gsub("{f}", "png")
+    URI.open(url) { |remote| File.binwrite(dest_path, remote.read) }
+  rescue StandardError
+    # Best-effort — silent skip
   end
 
-  # Only attempt submission when the product is in a state where Apple expects
-  # one. Apple's V2 submission endpoint shape (likely
-  # POST /v1/inAppPurchaseSubmissions) was not fully reconned; leaving as
-  # best-effort. Caller wraps in rescue.
-  SUBMITTABLE_IAP_STATES = %w[MISSING_METADATA DEVELOPER_ACTION_NEEDED].freeze
+  # POST /v1/inAppPurchaseSubmissions. JWT-verified 2026-05-07.
+  # Apple validates state + missing-fields server-side. If anything's
+  # off (missing screenshot, app-level Privacy URL absent, etc.) Apple
+  # returns descriptive errors. We re-raise so the caller's rescue
+  # surfaces them as warnings.
+  SUBMITTABLE_IAP_STATES = %w[MISSING_METADATA DEVELOPER_ACTION_NEEDED READY_TO_SUBMIT].freeze
 
   def submit_iap_for_review(iap_id:)
-    # Re-read the IAP to get its current state
-    resp = iap_client.get("v2/inAppPurchases/#{iap_id}")
-    state = resp.body.dig("data", "attributes", "state")
-    return unless SUBMITTABLE_IAP_STATES.include?(state)
+    state = iap_client.get("v2/inAppPurchases/#{iap_id}").body.dig("data", "attributes", "state")
+    unless SUBMITTABLE_IAP_STATES.include?(state)
+      UI.message(":: IAP #{iap_id} state=#{state.inspect} — not submittable, skipping")
+      return
+    end
 
-    # TODO: V2 submission shape — likely POST /v1/inAppPurchaseSubmissions
-    # with relationship to the IAP. Not yet reconned.
-    raise "IAP submit-for-review not yet implemented for V2 endpoints (current state=#{state})"
+    iap_client.post("v1/inAppPurchaseSubmissions", {
+      data: {
+        type: "inAppPurchaseSubmissions",
+        relationships: { inAppPurchaseV2: { data: { type: "inAppPurchases", id: iap_id } } }
+      }
+    })
   end
 
   # ── shared helper ───────────────────────────────────────────
