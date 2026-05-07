@@ -424,6 +424,20 @@ platform :ios do
     build_number = build.version
     UI.message(":: Latest TestFlight build: #{build_number}")
 
+    # If submission_info contains a `uses_idfa` key, PATCH it onto the
+    # version BEFORE deliver runs. `deliver`/Spaceship's AppStoreVersion
+    # model has no usesIdfa attr, so it's silently dropped if you put it
+    # in submission_information directly. Recon: docs/recon/usesIdfa.md
+    # in NovusOrdoApps/asc-ops-workflow.
+    if submission_info.key?("uses_idfa")
+      uses_idfa = submission_info["uses_idfa"]   # true / false / null
+      Spaceship::ConnectAPI::Tunes.client.patch(
+        "v1/appStoreVersions/#{version.id}",
+        { data: { type: "appStoreVersions", id: version.id, attributes: { usesIdfa: uses_idfa } } },
+      )
+      UI.message(":: Set usesIdfa=#{uses_idfa.inspect} on version #{app_version}")
+    end
+
     deliver(
       api_key: api_key,
       app_identifier: ENV.fetch("APP_BUNDLE_ID"),
@@ -703,6 +717,346 @@ platform :ios do
     UI.success("Dumped #{written} IAP(s) to #{output_path}.")
   end
 
+  # ──────────────────────────────────────────────
+  # update_data_usages
+  #
+  # Push App Privacy "Data Usage" disclosures (the privacy nutrition
+  # labels) for one app, then optionally publish them.
+  #
+  # Apple's public ASC OpenAPI does NOT document this surface; the
+  # endpoints DO exist at /v1/appDataUsages and friends, with JWT auth.
+  # Spaceship::ConnectAPI::Tunes has internal methods (post_app_data_usage,
+  # delete_app_data_usage, patch_app_data_usages_publish_state). We use
+  # them directly here, mirroring the update_iap pattern.
+  #
+  # Input layout (JSONC, parsed inline):
+  #
+  #   metadata/AppPrivacy/data_usages.jsonc:
+  #   {
+  #     "collects_data": true,                    // false → DATA_NOT_COLLECTED
+  #     "usages": [
+  #       { "category": "EMAIL_ADDRESS", "purpose": "ANALYTICS",
+  #         "protection": "DATA_LINKED_TO_YOU" },
+  #       ...
+  #     ],
+  #     "published": true                          // flip privacy details live
+  #   }
+  #
+  # Idempotent: GET existing usages → diff against JSONC → DELETE
+  # gone-tuples + POST new-tuples + leave matching ones alone. Each
+  # appDataUsage is immutable post-create; "update" = delete + recreate.
+  #
+  # Recon: docs/recon/data-usages.md in NovusOrdoApps/asc-ops-workflow.
+  #
+  # Usage: bundle exec fastlane update_data_usages input_path:metadata/AppPrivacy/data_usages.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_data_usages do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Data usages input file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    desired =
+      if spec.fetch("collects_data", true)
+        Array(spec.fetch("usages", [])).map { |u|
+          { category: u.fetch("category"), purpose: u.fetch("purpose"), protection: u.fetch("protection") }
+        }
+      else
+        # Single sentinel "we collect nothing" record. Per fastlane source,
+        # the body has only the dataProtection relationship for this case.
+        [{ category: nil, purpose: nil, protection: "DATA_NOT_COLLECTED" }]
+      end
+
+    existing = Spaceship::ConnectAPI::Tunes.client.get_app_data_usages(
+      app_id: app.id,
+      includes: "category,purpose,dataProtection",
+      limit: 500,
+    ).all_pages.to_a.flat_map { |page| page.to_models }
+
+    existing_tuples = existing.map { |u|
+      {
+        id: u.id,
+        category: u.respond_to?(:category) && u.category ? u.category.id : nil,
+        purpose: u.respond_to?(:purpose) && u.purpose ? u.purpose.id : nil,
+        protection: u.respond_to?(:data_protection) && u.data_protection ? u.data_protection.id : nil,
+      }
+    }
+
+    same = lambda { |a, b| a[:category] == b[:category] && a[:purpose] == b[:purpose] && a[:protection] == b[:protection] }
+
+    to_delete = existing_tuples.reject { |e| desired.any? { |d| same.call(e, d) } }
+    to_add    = desired.reject       { |d| existing_tuples.any? { |e| same.call(e, d) } }
+
+    UI.message(":: Existing: #{existing_tuples.size} · desired: #{desired.size} · delete: #{to_delete.size} · add: #{to_add.size}")
+
+    to_delete.each do |e|
+      Spaceship::ConnectAPI::Tunes.client.delete_app_data_usage(app_data_usage_id: e[:id])
+      UI.message(":: deleted appDataUsage #{e[:id]} (#{e[:category]}/#{e[:purpose]}/#{e[:protection]})")
+    end
+
+    to_add.each do |d|
+      Spaceship::ConnectAPI::Tunes.client.post_app_data_usage(
+        app_id: app.id,
+        app_data_usage_category_id: d[:category],
+        app_data_usage_purpose_id: d[:purpose],
+        app_data_usage_protection_id: d[:protection],
+      )
+      UI.message(":: created appDataUsage #{d[:category]}/#{d[:purpose]}/#{d[:protection]}")
+    end
+
+    if spec.key?("published")
+      target_published = spec.fetch("published") ? true : false
+      pub_resp = Spaceship::ConnectAPI::Tunes.client.get_app_data_usages_publish_state(app_id: app.id)
+      pub_data = pub_resp.respond_to?(:body) ? pub_resp.body["data"] : pub_resp["data"]
+      current_published = pub_data&.dig("attributes", "published")
+      pub_state_id = pub_data&.dig("id") || app.id
+
+      if current_published == target_published
+        UI.message(":: Publish state already #{current_published.inspect} — no change")
+      else
+        Spaceship::ConnectAPI::Tunes.client.patch_app_data_usages_publish_state(
+          app_data_usages_publish_state_id: pub_state_id,
+          published: target_published,
+        )
+        UI.success(":: Published state changed: #{current_published.inspect} → #{target_published.inspect}")
+      end
+    end
+
+    UI.success("Data usages synced for #{app.bundle_id}: #{desired.size} declared")
+  end
+
+  # ──────────────────────────────────────────────
+  # update_accessibility
+  #
+  # Push App Accessibility URL (apps.attributes.accessibilityUrl) and
+  # per-deviceFamily AccessibilityDeclaration records. Both are in
+  # Apple's public ASC API but `deliver` skips them; no Spaceship
+  # model class for declarations, so we use the request client directly.
+  #
+  # Recon: docs/recon/accessibility.md in NovusOrdoApps/asc-ops-workflow.
+  #
+  # Input layout (JSONC, parsed inline):
+  #
+  #   metadata/AppInfo/accessibility.jsonc:
+  #   {
+  #     "accessibility_url": "https://app.example/accessibility",
+  #     "declarations": {
+  #       "IPHONE": {
+  #         "supports_voiceover":                       true,
+  #         "supports_larger_text":                     true,
+  #         "supports_captions":                        false,
+  #         "supports_dark_interface":                  true,
+  #         "supports_audio_descriptions":              null,
+  #         "supports_differentiate_without_color_alone": null,
+  #         "supports_reduced_motion":                  null,
+  #         "supports_sufficient_contrast":             null,
+  #         "supports_voice_control":                   null
+  #       }
+  #     }
+  #   }
+  #
+  # Idempotent: GET existing → diff per device family → POST/PATCH/DELETE
+  # as needed. URL is a single PATCH.
+  #
+  # Usage: bundle exec fastlane update_accessibility input_path:metadata/AppInfo/accessibility.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_accessibility do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Accessibility input file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    client = Spaceship::ConnectAPI::Tunes.client
+
+    # 1. Accessibility URL (PATCH on the apps resource)
+    if spec.key?("accessibility_url")
+      desired_url = spec["accessibility_url"]
+      current_url = app.respond_to?(:accessibility_url) ? app.accessibility_url : nil
+
+      if current_url == desired_url
+        UI.message(":: accessibilityUrl already #{desired_url.inspect}")
+      else
+        client.patch("v1/apps/#{app.id}", {
+          data: { type: "apps", id: app.id, attributes: { accessibilityUrl: desired_url } },
+        })
+        UI.success(":: accessibilityUrl: #{current_url.inspect} → #{desired_url.inspect}")
+      end
+    end
+
+    # 2. Accessibility Declarations (per deviceFamily)
+    declarations = spec["declarations"] || {}
+    return UI.success("Accessibility URL updated; no declarations specified") if declarations.empty?
+
+    existing_resp = client.get("v1/apps/#{app.id}/accessibilityDeclarations", { "limit" => 50 })
+    existing = (existing_resp.body["data"] || []).map { |d|
+      { id: d["id"], device_family: d.dig("attributes", "deviceFamily"), attrs: d["attributes"] || {} }
+    }
+
+    # Map JSONC snake_case → API camelCase
+    snake_to_camel = ->(s) {
+      parts = s.to_s.split("_")
+      parts[0] + parts[1..].map(&:capitalize).join
+    }
+
+    declarations.each do |device_family, fields|
+      api_attrs = { "deviceFamily" => device_family }
+      fields.each { |k, v| api_attrs[snake_to_camel.call(k)] = v }
+
+      existing_decl = existing.find { |e| e[:device_family] == device_family }
+
+      if existing_decl
+        # PATCH the existing one
+        client.patch("v1/accessibilityDeclarations/#{existing_decl[:id]}", {
+          data: { type: "accessibilityDeclarations", id: existing_decl[:id], attributes: api_attrs.except("deviceFamily") },
+        })
+        UI.message(":: PATCHed accessibility declaration for #{device_family} (#{existing_decl[:id]})")
+      else
+        # POST a new one
+        client.post("v1/accessibilityDeclarations", {
+          data: {
+            type: "accessibilityDeclarations",
+            attributes: api_attrs,
+            relationships: { app: { data: { type: "apps", id: app.id } } },
+          },
+        })
+        UI.message(":: POSTed accessibility declaration for #{device_family}")
+      end
+    end
+
+    # Optionally DELETE declarations for device families absent from JSONC
+    # (uncomment if "remove" semantics are wanted):
+    # existing.each do |e|
+    #   next if declarations.key?(e[:device_family])
+    #   client.delete("v1/accessibilityDeclarations/#{e[:id]}")
+    #   UI.message(":: DELETEd stray declaration for #{e[:device_family]}")
+    # end
+
+    UI.success("Accessibility synced for #{app.bundle_id}: #{declarations.size} device family declarations")
+  end
+
+  # ──────────────────────────────────────────────
+  # update_eula
+  #
+  # Push custom End User License Agreement for one app. The territory
+  # relationship is IMMUTABLE post-create (Apple returns 403 on PATCH);
+  # any territory-list change forces DELETE-then-recreate.
+  #
+  # Recon: docs/recon/eula.md in NovusOrdoApps/asc-ops-workflow.
+  #
+  # Input layout (JSONC, parsed inline):
+  #
+  #   metadata/AppInfo/eula.jsonc:
+  #   {
+  #     "agreement_text": "Your custom EULA text...",
+  #     "territories": ["USA", "GBR", "DEU"]    // ISO 3166-1 alpha-3
+  #   }
+  #
+  # Set the file to {} or delete it to remove the custom EULA.
+  #
+  # Usage: bundle exec fastlane update_eula input_path:metadata/AppInfo/eula.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_eula do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("EULA input file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    client = Spaceship::ConnectAPI::Tunes.client
+
+    desired_text = spec["agreement_text"]
+    desired_territories = (spec["territories"] || []).sort
+
+    existing_resp = client.get("v1/apps/#{app.id}/endUserLicenseAgreement")
+    existing_eula = existing_resp.body["data"]   # nil if no custom EULA
+
+    # Cleanup case: empty / absent JSONC AND existing EULA → DELETE
+    if (desired_text.to_s.empty? || desired_territories.empty?) && existing_eula
+      client.delete("v1/endUserLicenseAgreements/#{existing_eula['id']}")
+      UI.success(":: Deleted custom EULA #{existing_eula['id']}")
+      next
+    end
+
+    if desired_text.to_s.empty? || desired_territories.empty?
+      UI.message(":: No EULA configured (agreement_text and/or territories empty); nothing to do")
+      next
+    end
+
+    if existing_eula
+      existing_id = existing_eula["id"]
+      existing_text = existing_eula.dig("attributes", "agreementText")
+
+      # Get current territories via the relationship endpoint
+      tr_resp = client.get("v1/endUserLicenseAgreements/#{existing_id}/relationships/territories", { "limit" => 200 })
+      existing_territories = (tr_resp.body["data"] || []).map { |t| t["id"] }.sort
+
+      if existing_territories != desired_territories
+        # Territories immutable → DELETE + recreate
+        UI.important(":: Territory list changed (#{existing_territories} → #{desired_territories}); recreating EULA")
+        client.delete("v1/endUserLicenseAgreements/#{existing_id}")
+        existing_eula = nil   # fall through to POST below
+      elsif existing_text != desired_text
+        # Same territories, different text → PATCH
+        client.patch("v1/endUserLicenseAgreements/#{existing_id}", {
+          data: { type: "endUserLicenseAgreements", id: existing_id, attributes: { agreementText: desired_text } },
+        })
+        UI.success(":: Updated EULA text on #{existing_id}")
+        next
+      else
+        UI.message(":: EULA already at desired state; no change")
+        next
+      end
+    end
+
+    # POST a new one
+    client.post("v1/endUserLicenseAgreements", {
+      data: {
+        type: "endUserLicenseAgreements",
+        attributes: { agreementText: desired_text },
+        relationships: {
+          app: { data: { type: "apps", id: app.id } },
+          territories: { data: desired_territories.map { |t| { type: "territories", id: t } } },
+        },
+      },
+    })
+    UI.success(":: Created custom EULA covering #{desired_territories.join(', ')}")
+  end
+
   # ── IAP helpers (private to update_iap / fetch_iap) ──────────
 
   # Spaceship's App.find does a partial filter through Apple's API then an
@@ -818,6 +1172,20 @@ platform :ios do
     return unless url
 
     URI.open(url) { |remote| File.binwrite(dest_path, remote.read) }
+  end
+
+  # ── shared helper ───────────────────────────────────────────
+  # Lightweight JSONC parser: strips UTF-8 BOM, // line comments
+  # outside quoted strings, and trailing commas before } / ].
+  # Same approach as submit_for_review's inline parser and
+  # scripts/transform_metadata.rb (kept in sync deliberately).
+  def parse_jsonc(raw)
+    require "json"
+    raw = raw.dup
+    raw = raw.delete_prefix("\xEF\xBB\xBF")
+    raw = raw.gsub(%r{^\s*//.*$}, "")
+    raw = raw.gsub(/,\s*([}\]])/, '\1')
+    JSON.parse(raw)
   end
 
 end
