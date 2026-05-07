@@ -139,6 +139,11 @@ jobs:
           fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           fallback_team_id:   ${{ vars.IOS_RELEASE_TEAM_ID }}
 
+
+      - name: Resolve app bundle ID (asc-app.jsonc → fallback to repo var)
+        uses: ./_ci/.github/actions/resolve-app-bundle-id
+        with:
+          fallback: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
       - name: Encode match git credentials
         run: |
           ENCODED=$(printf "pat:%s" "${{ secrets.MATCH_GIT_PAT }}" | base64 | tr -d '\n')

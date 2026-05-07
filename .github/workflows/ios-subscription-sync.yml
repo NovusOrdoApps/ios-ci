@@ -47,7 +47,6 @@ jobs:
       pull-requests: write
 
     env:
-      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
 
     steps:
       - name: Checkout repo
@@ -77,6 +76,11 @@ jobs:
           fallback_key_id:    ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
 
+
+      - name: Resolve app bundle ID (asc-app.jsonc → fallback to repo var)
+        uses: ./_ci/.github/actions/resolve-app-bundle-id
+        with:
+          fallback: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
       - name: Validate inputs
         run: |
           : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"

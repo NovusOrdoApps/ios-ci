@@ -1,0 +1,77 @@
+name: "Resolve app bundle ID"
+description: >-
+  Sets APP_BUNDLE_ID in $GITHUB_ENV. Prefers asc-app.jsonc at the
+  caller-repo root (the canonical source-controlled identity for Class 2
+  app repos provisioned by asc-init); falls back to a passed-in value
+  (typically the IOS_RELEASE_APP_BUNDLE_ID repo variable for Class 1).
+
+  Order of precedence:
+    1. asc-app.jsonc → bundle_id field (if file present and field non-empty)
+    2. fallback input (caller passes ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }})
+    3. Error if both empty
+
+  Run AFTER 'actions/checkout@v4' on the caller repo.
+
+inputs:
+  fallback:
+    description: "Fallback bundle ID (typically vars.IOS_RELEASE_APP_BUNDLE_ID)."
+    required: false
+    default: ""
+  jsonc_path:
+    description: "Path to asc-app.jsonc relative to repo root."
+    required: false
+    default: "asc-app.jsonc"
+
+outputs:
+  bundle_id:
+    description: "The resolved bundle ID."
+    value: ${{ steps.resolve.outputs.bundle_id }}
+  source:
+    description: "'asc-app.jsonc' or 'fallback'."
+    value: ${{ steps.resolve.outputs.source }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve APP_BUNDLE_ID
+      id: resolve
+      shell: bash
+      env:
+        FALLBACK:   ${{ inputs.fallback }}
+        JSONC_PATH: ${{ inputs.jsonc_path }}
+      run: |
+        set -e
+        bid=""
+        source=""
+
+        if [ -f "$JSONC_PATH" ]; then
+          # Strip // comments + trailing commas before parsing as JSON.
+          bid=$(ruby -rjson -e '
+            raw = File.read(ENV["JSONC_PATH"])
+            raw = raw.delete_prefix("\xEF\xBB\xBF")
+            raw = raw.gsub(%r{^\s*//.*$}, "")
+            raw = raw.gsub(/,\s*([}\]])/, "\1")
+            data = JSON.parse(raw) rescue {}
+            puts data["bundle_id"].to_s
+          ' 2>/dev/null || true)
+          if [ -n "$bid" ] && [ "$bid" != "null" ]; then
+            source="asc-app.jsonc"
+          else
+            bid=""
+          fi
+        fi
+
+        if [ -z "$bid" ] && [ -n "$FALLBACK" ]; then
+          bid="$FALLBACK"
+          source="fallback"
+        fi
+
+        if [ -z "$bid" ]; then
+          echo "::error::Could not resolve app bundle ID. Either add bundle_id to $JSONC_PATH or set IOS_RELEASE_APP_BUNDLE_ID repo variable."
+          exit 1
+        fi
+
+        echo "APP_BUNDLE_ID=$bid"  >> "$GITHUB_ENV"
+        echo "bundle_id=$bid"      >> "$GITHUB_OUTPUT"
+        echo "source=$source"      >> "$GITHUB_OUTPUT"
+        echo ":: APP_BUNDLE_ID resolved from $source → $bid"
