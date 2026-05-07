@@ -576,8 +576,9 @@ platform :ios do
     UI.user_error!("No products in #{input_path}") if products.empty?
 
     type_to_apple = {
-      "consumable"     => "CONSUMABLE",
-      "non_consumable" => "NON_CONSUMABLE",
+      "consumable"               => "CONSUMABLE",
+      "non_consumable"           => "NON_CONSUMABLE",
+      "non_renewing_subscription" => "NON_RENEWING_SUBSCRIPTION",
     }.freeze
 
     existing = {}
@@ -699,8 +700,9 @@ platform :ios do
 
     iaps = list_app_iaps(app.id)
     apple_to_type = {
-      "CONSUMABLE"     => "consumable",
-      "NON_CONSUMABLE" => "non_consumable",
+      "CONSUMABLE"               => "consumable",
+      "NON_CONSUMABLE"           => "non_consumable",
+      "NON_RENEWING_SUBSCRIPTION" => "non_renewing_subscription",
     }.freeze
 
     written = 0
@@ -1043,6 +1045,94 @@ platform :ios do
       },
     })
     UI.success(":: Created custom EULA covering #{desired_territories.join(', ')}")
+  end
+
+  # ──────────────────────────────────────────────
+  # update_subscription_status_url
+  #
+  # Sets Apple's "Server-to-Server Notifications" URL pair on the App
+  # resource via PATCH /v1/apps/<id>. These URLs receive auto-renewable
+  # subscription state changes from Apple. Production + sandbox URLs are
+  # set independently; either can be omitted.
+  #
+  # Apple requires the matching `version` ("V1" | "V2") to be set when
+  # a URL is set. We default to V2 (current) when a URL is given without
+  # an explicit version. To clear a URL, set it to null.
+  #
+  # Source: PATCH /v1/apps/<id> attributes:
+  #   subscriptionStatusUrl
+  #   subscriptionStatusUrlForSandbox
+  #   subscriptionStatusUrlVersion           ("V1" | "V2")
+  #   subscriptionStatusUrlVersionForSandbox ("V1" | "V2")
+  #
+  # Usage: bundle exec fastlane update_subscription_status_url \
+  #          input_path:/path/to/subscription_status_url.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_subscription_status_url do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Subscription status URL input file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+    if spec.empty?
+      UI.message(":: subscription_status_url.jsonc is empty; nothing to do")
+      next
+    end
+
+    valid_versions = %w[V1 V2].freeze
+    desired = {}
+
+    if spec.key?("production_url")
+      desired["subscriptionStatusUrl"] = spec["production_url"]
+      version = spec["production_version"] || (spec["production_url"] ? "V2" : nil)
+      if version && !valid_versions.include?(version)
+        UI.user_error!("production_version must be one of #{valid_versions} (got #{version.inspect})")
+      end
+      desired["subscriptionStatusUrlVersion"] = version
+    end
+
+    if spec.key?("sandbox_url")
+      desired["subscriptionStatusUrlForSandbox"] = spec["sandbox_url"]
+      version = spec["sandbox_version"] || (spec["sandbox_url"] ? "V2" : nil)
+      if version && !valid_versions.include?(version)
+        UI.user_error!("sandbox_version must be one of #{valid_versions} (got #{version.inspect})")
+      end
+      desired["subscriptionStatusUrlVersionForSandbox"] = version
+    end
+
+    if desired.empty?
+      UI.message(":: No production_url / sandbox_url keys present; nothing to do")
+      next
+    end
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    client = Spaceship::ConnectAPI.client.tunes_request_client
+
+    # Read current state to keep the lane idempotent.
+    current_resp = client.get("v1/apps/#{app.id}", {
+      "fields[apps]" => "subscriptionStatusUrl,subscriptionStatusUrlForSandbox,subscriptionStatusUrlVersion,subscriptionStatusUrlVersionForSandbox",
+    })
+    current = current_resp.body.dig("data", "attributes") || {}
+
+    diff = desired.reject { |k, v| current[k] == v }
+    if diff.empty?
+      UI.success(":: All subscription-status URL fields already at desired state; no PATCH sent")
+      next
+    end
+
+    client.patch("v1/apps/#{app.id}", {
+      data: { type: "apps", id: app.id, attributes: diff },
+    })
+
+    diff.each { |k, v| UI.success(":: #{k}: #{current[k].inspect} → #{v.inspect}") }
   end
 
   # ── IAP helpers (private to update_iap / fetch_iap) ──────────

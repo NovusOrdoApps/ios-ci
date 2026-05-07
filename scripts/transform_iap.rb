@@ -33,7 +33,14 @@ FIELD_LIMITS = {
   "product_id"     => 255,
 }.freeze
 
-VALID_TYPES = %w[consumable non_consumable].freeze
+VALID_TYPES = %w[consumable non_consumable non_renewing_subscription].freeze
+# Apple's family-sharing rule:
+#   non_consumable           — opt-in (true or false)
+#   consumable               — must be false (Apple rejects)
+#   non_renewing_subscription — must be false (Apple rejects)
+# Auto-renewable subscriptions live on a different endpoint (/v1/subscriptions)
+# and are handled by the subscription lanes, not here.
+NON_FAMILY_SHAREABLE_TYPES = %w[consumable non_renewing_subscription].freeze
 
 def fail_with(errors)
   errors.each { |e| warn("ERROR: #{e}") }
@@ -189,8 +196,8 @@ product_dirs.each do |product_id|
     errors << "#{product_id}: family_shareable must be true or false (got #{family_shareable.inspect})"
   end
 
-  if family_shareable && type == "consumable"
-    errors << "#{product_id}: family_shareable is only valid for non_consumable products"
+  if family_shareable && NON_FAMILY_SHAREABLE_TYPES.include?(type)
+    errors << "#{product_id}: family_shareable=true is only valid for non_consumable products (got type=#{type})"
   end
 
   text_dir = File.join(product_path, "Text")
