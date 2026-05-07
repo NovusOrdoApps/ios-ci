@@ -1573,21 +1573,44 @@ platform :ios do
         sub_id = existing["id"]
         sync_subscription_localizations(sub_id: sub_id, pid: pid, source_locs: sub.fetch("localizations"))
 
+        # Pricing pipeline (3 phases — Apple stores subscription prices
+        # per-(sub, territory) with NO automatic derivation, so every
+        # enabled territory needs an explicit price or sub stays in
+        # MISSING_METADATA forever):
+        #
+        #   1. Base USD price → POSTs SubscriptionPrice for USA
+        #   2. Equalize: for every other territory in availability,
+        #      POST the equivalent local-currency price using Apple's
+        #      pricing-matrix equalizations relative to the USA point
+        #   3. Per-territory overrides (territory_prices) — applied
+        #      LAST so they replace the equalized defaults where
+        #      explicit values are given
+        #
+        # Skipped for territories that already have a price (idempotent).
         if sub["customer_price"]
           begin
             sync_subscription_price(sub_id: sub_id, customer_price: sub["customer_price"])
+
+            # After USA is set, fan out to all other enabled territories
+            # via Apple's equalizations — but skip ones the user is about
+            # to override explicitly via territory_prices.
+            usa_point_id = fetch_subscription_price_point_id(
+              sub_id: sub_id, customer_price: sub["customer_price"], territory: "USA"
+            )
+            equalize_subscription_prices(
+              sub_id: sub_id,
+              base_point_id: usa_point_id,
+              exclude_territories: (sub["territory_prices"] || {}).keys,
+            )
           rescue StandardError => e
-            warnings << "#{pid}: base price update failed: #{e.message}"
+            warnings << "#{pid}: base price / equalization failed: #{e.message}"
           end
         end
 
-        # Per-territory price overrides on top of customer_price (USD base).
-        # Each entry POSTs a SubscriptionPrice with the matching local-currency
-        # price point + the territory rel; idempotent (skipped if Apple already
-        # has that exact (territory, price) combination).
-        # NOTE: this lane is additive — removing a territory from the file does
-        # NOT clear an existing override on Apple. To remove an override, set
-        # it to the same value as customer_price (Apple replaces it).
+        # Per-territory overrides applied LAST. Each POST adds a new
+        # SubscriptionPrice with the override; Apple's "latest price
+        # wins" semantics replaces the equalized default for that
+        # territory.
         (sub["territory_prices"] || {}).each do |territory, price|
           begin
             sync_subscription_price(sub_id: sub_id, customer_price: price, territory: territory)
@@ -2029,6 +2052,14 @@ platform :ios do
       territory: territory || "USA",
     )
 
+    sync_subscription_price_by_point_id(sub_id: sub_id, point_id: point_id, territory: territory)
+  end
+
+  # Lower-level: POST a SubscriptionPrice with a known price-point id.
+  # Used both by sync_subscription_price (which looks up the point by
+  # customer_price string) and by equalize_subscription_prices (which
+  # already has the equalized point id from Apple's matrix).
+  def sync_subscription_price_by_point_id(sub_id:, point_id:, territory: nil)
     rels = {
       subscription:           { data: { type: "subscriptions",           id: sub_id   } },
       subscriptionPricePoint: { data: { type: "subscriptionPricePoints", id: point_id } },
@@ -2042,6 +2073,84 @@ platform :ios do
         relationships: rels,
       }
     })
+  end
+
+  # GET /v1/subscriptionPricePoints/<usa_point_id>/equalizations
+  # Apple's pricing matrix surfaced via REST: returns the equivalent
+  # local-currency price point per non-USA territory for a given USA
+  # anchor point. ~174 entries (one per Apple territory minus USA).
+  #
+  # Returns hash { alpha3_territory => point_id }.
+  #
+  # The equalization response doesn't include a `relationships.territory`
+  # entry by default — but every Apple subscription price-point id is a
+  # base64-encoded JSON of {"s":"<sub_id>","t":"<alpha3>","p":"<tier>"}.
+  # We decode the id to get the territory.
+  def fetch_subscription_equalizations(base_point_id:)
+    require "base64"
+    require "json"
+
+    resp = iap_client.get(
+      "v1/subscriptionPricePoints/#{base_point_id}/equalizations",
+      { "limit" => 200 }
+    ).body
+
+    out = {}
+    (resp["data"] || []).each do |entry|
+      decoded = JSON.parse(Base64.decode64(entry["id"]))
+      territory = decoded["t"]
+      out[territory] = entry["id"] if territory
+    rescue StandardError
+      # Skip ids we can't decode — Apple may add new id schemes someday.
+    end
+    out
+  rescue StandardError => e
+    UI.important("fetch_subscription_equalizations failed: #{e.message}")
+    {}
+  end
+
+  # Auto-fill prices for every territory in the sub's availability list
+  # that doesn't already have a price (and isn't in exclude_territories).
+  # Uses Apple's equalizations matrix relative to the USA anchor point.
+  #
+  # Why this matters: Apple stores subscription prices per-(sub, territory)
+  # with NO automatic derivation. If a sub is enabled in 175 territories
+  # but only USA has a price, the sub stays in MISSING_METADATA forever.
+  # The web UI does this auto-fill behind the scenes when you set the
+  # base price; we do it via this helper.
+  #
+  # exclude_territories: alpha-3 codes of territories the caller will
+  # set explicitly via territory_prices overrides — we skip those here
+  # so we don't waste a POST that gets immediately overridden.
+  def equalize_subscription_prices(sub_id:, base_point_id:, exclude_territories: [])
+    avail = fetch_subscription_availability(sub_id: sub_id)
+    return 0 unless avail
+    enabled_territories = avail["territories"] || []
+
+    current_prices = fetch_subscription_all_prices(sub_id: sub_id)
+    excluded = (exclude_territories + ["USA"] + current_prices.keys).uniq
+
+    equalizations = fetch_subscription_equalizations(base_point_id: base_point_id)
+
+    posted = 0
+    enabled_territories.each do |territory|
+      next if excluded.include?(territory)
+
+      eq_point_id = equalizations[territory]
+      unless eq_point_id
+        UI.important(":: equalize: no equivalent point for territory '#{territory}' — skipping")
+        next
+      end
+
+      begin
+        sync_subscription_price_by_point_id(sub_id: sub_id, point_id: eq_point_id, territory: territory)
+        posted += 1
+      rescue StandardError => e
+        UI.important(":: equalize #{territory}: #{e.message}")
+      end
+    end
+    UI.message(":: equalize_subscription_prices: posted #{posted} prices across territories (skipped #{excluded.size} already-set / overridden)") if posted > 0
+    posted
   end
 
   # GET /v1/subscriptions/<id>/subscriptionAvailability
