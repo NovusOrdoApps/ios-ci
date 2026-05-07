@@ -1610,6 +1610,12 @@ platform :ios do
           source_offers: sub["promotional_offers"],
           warnings: warnings,
         )
+
+        sync_subscription_offer_codes(
+          sub_id: sub_id, pid: pid,
+          source_codes: sub["offer_codes"],
+          warnings: warnings,
+        )
       end
 
       # Group-level submission — submits every subscription in the
@@ -1728,6 +1734,7 @@ platform :ios do
           "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
           "introductory_offers"          => fetch_subscription_introductory_offers(sub_id: sub["id"]),
           "promotional_offers"           => fetch_subscription_promotional_offers(sub_id: sub["id"]),
+          "offer_codes"                  => fetch_subscription_offer_codes(sub_id: sub["id"]),
         }
         File.write(File.join(sub_dir, "subscription.json"), JSON.pretty_generate(meta))
 
@@ -2509,6 +2516,255 @@ platform :ios do
         "territory_prices"  => territory_prices,
       }
     end
+  end
+
+  # GET /v1/subscriptions/<id>/offerCodes
+  def list_subscription_offer_codes(sub_id:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/offerCodes", { "limit" => 200 }).body
+    resp["data"] || []
+  end
+
+  # GET /v1/subscriptionOfferCodes/<id>/prices?include=territory,subscriptionPricePoint
+  # Same shape/limit as promo offer prices.
+  def fetch_offer_code_prices(offer_code_id:)
+    resp = iap_client.get("v1/subscriptionOfferCodes/#{offer_code_id}/prices", {
+      "include" => "territory,subscriptionPricePoint",
+      "limit"   => 200,
+    }).body
+    point_prices = (resp["included"] || [])
+      .select { |x| x["type"] == "subscriptionPricePoints" }
+      .each_with_object({}) { |x, h| h[x["id"]] = x.dig("attributes", "customerPrice") }
+    out = {}
+    (resp["data"] || []).each do |row|
+      terr  = row.dig("relationships", "territory", "data", "id")
+      pp_id = row.dig("relationships", "subscriptionPricePoint", "data", "id")
+      out[terr] = point_prices[pp_id] if terr && point_prices[pp_id]
+    end
+    out
+  rescue StandardError
+    {}
+  end
+
+  # GET /v1/subscriptionOfferCodes/<id>/customCodes — returns custom
+  # code records (the user-visible code string + max redemptions + expiry).
+  def fetch_offer_code_custom_codes(offer_code_id:)
+    resp = iap_client.get("v1/subscriptionOfferCodes/#{offer_code_id}/customCodes", { "limit" => 200 }).body
+    resp["data"] || []
+  rescue StandardError
+    []
+  end
+
+  # GET /v1/subscriptionOfferCodes/<id>/oneTimeUseCodes — returns
+  # one-time-use batch records (counts + expiry + environment).
+  def fetch_offer_code_one_time_codes(offer_code_id:)
+    resp = iap_client.get("v1/subscriptionOfferCodes/#{offer_code_id}/oneTimeUseCodes", { "limit" => 200 }).body
+    resp["data"] || []
+  rescue StandardError
+    []
+  end
+
+  # POST /v1/subscriptionOfferCodes — creates the parent code config
+  # (mode/duration/eligibility + per-territory prices). Mirrors promo
+  # offer create pattern with included inline prices. Returns the new
+  # offer code resource.
+  def create_subscription_offer_code(sub_id:, name:, customer_eligibilities:, offer_eligibility:,
+                                     offer_mode:, duration:, number_of_periods:,
+                                     auto_renew_enabled:, territory_to_point:)
+    inline_ids = territory_to_point.keys.each_with_index.map { |_, i| "${ocprice-#{i}}" }
+    included   = territory_to_point.each_with_index.map do |(territory, point_id), i|
+      {
+        id:   "${ocprice-#{i}}",
+        type: "subscriptionOfferCodePrices",
+        relationships: {
+          territory:              { data: { type: "territories",              id: territory } },
+          subscriptionPricePoint: { data: { type: "subscriptionPricePoints",  id: point_id } },
+        },
+      }
+    end
+
+    resp = iap_client.post("v1/subscriptionOfferCodes", {
+      data: {
+        type: "subscriptionOfferCodes",
+        attributes: {
+          name:                  name,
+          customerEligibilities: customer_eligibilities,
+          offerEligibility:      offer_eligibility,
+          offerMode:             offer_mode,
+          duration:              duration,
+          numberOfPeriods:       number_of_periods,
+          autoRenewEnabled:      auto_renew_enabled,
+        },
+        relationships: {
+          subscription: { data: { type: "subscriptions", id: sub_id } },
+          prices:       { data: inline_ids.map { |id| { type: "subscriptionOfferCodePrices", id: id } } },
+        },
+      },
+      included: included,
+    })
+    resp.body["data"]
+  end
+
+  # POST /v1/subscriptionOfferCodeCustomCodes — attach one re-usable
+  # code string (e.g. "BLACKFRIDAY2026") with a redemption limit.
+  def create_offer_code_custom(offer_code_id:, custom_code:, number_of_codes:, expiration_date: nil)
+    attrs = { customCode: custom_code, numberOfCodes: number_of_codes }
+    attrs[:expirationDate] = expiration_date if expiration_date
+    iap_client.post("v1/subscriptionOfferCodeCustomCodes", {
+      data: {
+        type: "subscriptionOfferCodeCustomCodes",
+        attributes: attrs,
+        relationships: { offerCode: { data: { type: "subscriptionOfferCodes", id: offer_code_id } } },
+      },
+    })
+  end
+
+  # POST /v1/subscriptionOfferCodeOneTimeUseCodes — attach a batch of
+  # unique codes (Apple generates them; download from ASC after).
+  def create_offer_code_one_time(offer_code_id:, number_of_codes:, expiration_date:, environment: "PRODUCTION")
+    iap_client.post("v1/subscriptionOfferCodeOneTimeUseCodes", {
+      data: {
+        type: "subscriptionOfferCodeOneTimeUseCodes",
+        attributes: {
+          numberOfCodes:  number_of_codes,
+          expirationDate: expiration_date,
+          environment:    environment,
+        },
+        relationships: { offerCode: { data: { type: "subscriptionOfferCodes", id: offer_code_id } } },
+      },
+    })
+  end
+
+  # Orchestrator: each source offer code creates one OfferCode parent
+  # + one CustomCode OR OneTimeUseCode child. Idempotent by `name` —
+  # if an offer code with the same name exists for this sub, we skip
+  # both the parent and the child (replacement-via-API is v2).
+  def sync_subscription_offer_codes(sub_id:, pid:, source_codes:, warnings:)
+    return if source_codes.nil? || source_codes.empty?
+
+    existing_names = list_subscription_offer_codes(sub_id: sub_id)
+                       .map { |o| o.dig("attributes", "name") }
+
+    source_codes.each_with_index do |entry, idx|
+      name = entry["name"]
+      if existing_names.include?(name)
+        next
+      end
+
+      type = entry["type"]
+      unless %w[custom one_time_use].include?(type)
+        warnings << "#{pid}: offer_codes[#{idx}] has invalid type #{type.inspect} (must be 'custom' or 'one_time_use')"
+        next
+      end
+
+      mode      = entry["offer_mode"]
+      base      = entry["customer_price"]
+      overrides = entry["territory_prices"] || {}
+      desired   = {}
+      desired["USA"] = base if base
+      overrides.each { |t, p| desired[t] = p }
+
+      if desired.empty? && %w[PAY_AS_YOU_GO PAY_UP_FRONT].include?(mode)
+        warnings << "#{pid}: offer_codes[#{idx}] '#{name}' has no prices (PAY_* modes need customer_price or territory_prices)"
+        next
+      end
+
+      begin
+        territory_to_point = {}
+        desired.each do |territory, price|
+          territory_to_point[territory] = fetch_subscription_price_point_id(
+            sub_id: sub_id, customer_price: price, territory: territory
+          )
+        end
+
+        new_oc = create_subscription_offer_code(
+          sub_id:                 sub_id,
+          name:                   name,
+          customer_eligibilities: entry.fetch("customer_eligibilities"),
+          offer_eligibility:      entry.fetch("offer_eligibility"),
+          offer_mode:             mode,
+          duration:               entry.fetch("duration"),
+          number_of_periods:      entry.fetch("number_of_periods"),
+          auto_renew_enabled:     entry.fetch("auto_renew_enabled", true),
+          territory_to_point:     territory_to_point,
+        )
+
+        oc_id = new_oc["id"]
+
+        if type == "custom"
+          create_offer_code_custom(
+            offer_code_id:   oc_id,
+            custom_code:     entry.fetch("custom_code"),
+            number_of_codes: entry.fetch("max_redemptions"),
+            expiration_date: entry["expiration_date"],
+          )
+        else  # one_time_use
+          create_offer_code_one_time(
+            offer_code_id:   oc_id,
+            number_of_codes: entry.fetch("code_count"),
+            expiration_date: entry.fetch("expiration_date"),
+            environment:     entry.fetch("environment", "PRODUCTION"),
+          )
+        end
+      rescue Spaceship::UnexpectedResponse => e
+        warnings << "#{pid}: offer_code '#{name}' failed: #{e.message}"
+      rescue StandardError => e
+        warnings << "#{pid}: offer_code '#{name}' failed: #{e.message}"
+      end
+    end
+  end
+
+  # Round-trip dump. Compresses each Apple OfferCode + child into
+  # one source-shape entry. Type inferred from which child exists.
+  # Orphan parents (no child) are dropped from the dump with a warning
+  # — they happen when create_subscription_offer_code succeeds but the
+  # subsequent child create fails (e.g. Apple's "parent App is not
+  # active" gate on unpublished apps).
+  def fetch_subscription_offer_codes(sub_id:)
+    list_subscription_offer_codes(sub_id: sub_id).map do |oc|
+      attrs = oc["attributes"] || {}
+      oc_id = oc["id"]
+
+      customs  = fetch_offer_code_custom_codes(offer_code_id: oc_id)
+      onetimes = fetch_offer_code_one_time_codes(offer_code_id: oc_id)
+      if customs.empty? && onetimes.empty?
+        UI.important(":: orphan subscriptionOfferCode '#{attrs['name']}' (id=#{oc_id}) has no child code records — skipping in dump") if defined?(UI)
+        next nil
+      end
+
+      terr_to_price    = fetch_offer_code_prices(offer_code_id: oc_id)
+      base_price       = terr_to_price["USA"]
+      territory_prices = terr_to_price.reject { |t, _| t == "USA" }
+
+      base = {
+        "name"                    => attrs["name"],
+        "customer_eligibilities"  => attrs["customerEligibilities"],
+        "offer_eligibility"       => attrs["offerEligibility"],
+        "offer_mode"              => attrs["offerMode"],
+        "duration"                => attrs["duration"],
+        "number_of_periods"       => attrs["numberOfPeriods"],
+        "auto_renew_enabled"      => attrs["autoRenewEnabled"],
+        "customer_price"          => base_price,
+        "territory_prices"        => territory_prices,
+      }
+
+      if customs.any?
+        c = customs.first.dig("attributes") || {}
+        base.merge(
+          "type"            => "custom",
+          "custom_code"     => c["customCode"],
+          "max_redemptions" => c["numberOfCodes"],
+          "expiration_date" => c["expirationDate"],
+        )
+      else
+        o = onetimes.first.dig("attributes") || {}
+        base.merge(
+          "type"            => "one_time_use",
+          "code_count"      => o["numberOfCodes"],
+          "expiration_date" => o["expirationDate"],
+          "environment"     => o["environment"],
+        )
+      end
+    end.compact
   end
 
   # POST /v1/subscriptionGroupSubmissions — submits the WHOLE GROUP

@@ -44,6 +44,10 @@ VALID_PERIODS = %w[ONE_WEEK ONE_MONTH TWO_MONTHS THREE_MONTHS SIX_MONTHS ONE_YEA
 VALID_OFFER_DURATIONS = %w[THREE_DAYS ONE_WEEK TWO_WEEKS ONE_MONTH TWO_MONTHS THREE_MONTHS SIX_MONTHS ONE_YEAR].freeze
 VALID_OFFER_MODES     = %w[FREE_TRIAL PAY_AS_YOU_GO PAY_UP_FRONT].freeze
 PAID_OFFER_MODES      = %w[PAY_AS_YOU_GO PAY_UP_FRONT].freeze
+VALID_OC_CUSTOMER_ELIGIBILITIES = %w[NEW EXISTING EXPIRED].freeze
+VALID_OC_OFFER_ELIGIBILITY      = %w[STACK_WITH_INTRO_OFFERS REPLACE_INTRO_OFFERS].freeze
+VALID_OC_TYPES                  = %w[custom one_time_use].freeze
+VALID_OC_ENVIRONMENTS           = %w[PRODUCTION SANDBOX].freeze
 
 def fail_with(errors)
   errors.each { |e| warn("ERROR: #{e}") }
@@ -389,6 +393,109 @@ group_dirs.each do |group_folder|
       end
     end
 
+    # Optional offer_codes: list of redemption-code configurations.
+    # Each entry creates ONE OfferCode resource + ONE child (custom or
+    # one_time_use). type drives which child fields are required.
+    offer_codes = sub_meta["offer_codes"]
+    if offer_codes && !offer_codes.is_a?(Array)
+      errors << "#{group_folder}/#{product_id}: offer_codes must be an array (got #{offer_codes.class})"
+    elsif offer_codes
+      offer_codes.each_with_index do |entry, idx|
+        path = "#{group_folder}/#{product_id}: offer_codes[#{idx}]"
+        unless entry.is_a?(Hash)
+          errors << "#{path} must be an object"
+          next
+        end
+
+        name = entry["name"]
+        errors << "#{path}.name is required (string)" unless name.is_a?(String) && !name.empty?
+
+        elig = entry["customer_eligibilities"]
+        if !elig.is_a?(Array) || elig.empty?
+          errors << "#{path}.customer_eligibilities must be a non-empty array of #{VALID_OC_CUSTOMER_ELIGIBILITIES}"
+        elsif (elig - VALID_OC_CUSTOMER_ELIGIBILITIES).any?
+          errors << "#{path}.customer_eligibilities has invalid values: #{(elig - VALID_OC_CUSTOMER_ELIGIBILITIES).inspect}"
+        end
+
+        oe = entry["offer_eligibility"]
+        unless VALID_OC_OFFER_ELIGIBILITY.include?(oe)
+          errors << "#{path}.offer_eligibility must be one of #{VALID_OC_OFFER_ELIGIBILITY} (got #{oe.inspect})"
+        end
+
+        mode = entry["offer_mode"]
+        unless VALID_OFFER_MODES.include?(mode)
+          errors << "#{path}.offer_mode must be one of #{VALID_OFFER_MODES} (got #{mode.inspect})"
+        end
+
+        dur = entry["duration"]
+        unless VALID_OFFER_DURATIONS.include?(dur)
+          errors << "#{path}.duration must be one of #{VALID_OFFER_DURATIONS} (got #{dur.inspect})"
+        end
+
+        periods = entry["number_of_periods"]
+        unless periods.is_a?(Integer) && periods >= 1
+          errors << "#{path}.number_of_periods must be a positive integer (got #{periods.inspect})"
+        end
+
+        autorenew = entry.fetch("auto_renew_enabled", true)
+        unless [true, false].include?(autorenew)
+          errors << "#{path}.auto_renew_enabled must be true or false (got #{autorenew.inspect})"
+        end
+        # Apple-side rule: auto_renew_enabled=false is only allowed for FREE_TRIAL.
+        # PAY_AS_YOU_GO and PAY_UP_FRONT must keep auto-renewal on.
+        if autorenew == false && mode != "FREE_TRIAL"
+          errors << "#{path}.auto_renew_enabled=false is only allowed when offer_mode='FREE_TRIAL' (got #{mode.inspect})"
+        end
+
+        # Pricing same shape as promo offers
+        base = entry["customer_price"]
+        if base && !(base.is_a?(String) && base.match?(/\A\d+(\.\d{1,2})?\z/))
+          errors << "#{path}.customer_price must be a price string (got #{base.inspect})"
+        end
+        terr_prices = entry["territory_prices"]
+        if terr_prices && !terr_prices.is_a?(Hash)
+          errors << "#{path}.territory_prices must be {alpha3: \"price\"}"
+        elsif terr_prices
+          terr_prices.each do |t, p|
+            errors << "#{path}.territory_prices key #{t.inspect} not alpha-3" unless t.is_a?(String) && t.match?(/\A[A-Z]{3}\z/)
+            errors << "#{path}.territory_prices[#{t}] must be a price string" unless p.is_a?(String) && p.match?(/\A\d+(\.\d{1,2})?\z/)
+          end
+        end
+        if PAID_OFFER_MODES.include?(mode) && base.to_s.empty? && (terr_prices.nil? || terr_prices.empty?)
+          errors << "#{path} needs at least one price for #{mode} mode"
+        end
+
+        type = entry["type"]
+        unless VALID_OC_TYPES.include?(type)
+          errors << "#{path}.type must be 'custom' or 'one_time_use' (got #{type.inspect})"
+        end
+
+        if type == "custom"
+          unless entry["custom_code"].is_a?(String) && !entry["custom_code"].empty?
+            errors << "#{path}.custom_code is required for type 'custom' (the redemption-code string)"
+          end
+          unless entry["max_redemptions"].is_a?(Integer) && entry["max_redemptions"] >= 1
+            errors << "#{path}.max_redemptions must be a positive integer for type 'custom'"
+          end
+        elsif type == "one_time_use"
+          unless entry["code_count"].is_a?(Integer) && entry["code_count"] >= 1
+            errors << "#{path}.code_count must be a positive integer for type 'one_time_use'"
+          end
+          unless entry["expiration_date"].is_a?(String) && entry["expiration_date"].match?(/\A\d{4}-\d{2}-\d{2}\z/)
+            errors << "#{path}.expiration_date is required for type 'one_time_use' (ISO YYYY-MM-DD)"
+          end
+          env = entry.fetch("environment", "PRODUCTION")
+          unless VALID_OC_ENVIRONMENTS.include?(env)
+            errors << "#{path}.environment must be one of #{VALID_OC_ENVIRONMENTS} (got #{env.inspect})"
+          end
+        end
+
+        if entry["expiration_date"] && !(entry["expiration_date"].is_a?(String) && entry["expiration_date"].match?(/\A\d{4}-\d{2}-\d{2}\z/))
+          errors << "#{path}.expiration_date must be ISO YYYY-MM-DD (got #{entry['expiration_date'].inspect})"
+        end
+      end
+    end
+
     sub_localizations = collect_localizations(
       File.join(sub_path, "Text"),
       { "name" => true, "description" => true },
@@ -420,6 +527,7 @@ group_dirs.each do |group_folder|
       "promotional_image"            => promo_image_path,
       "introductory_offers"          => intro_offers || [],
       "promotional_offers"           => promo_offers || [],
+      "offer_codes"                  => offer_codes || [],
       "localizations"                => sub_localizations,
     }
   end
