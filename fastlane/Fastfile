@@ -711,11 +711,15 @@ platform :ios do
       family_sharable = iap.dig("attributes", "familySharable")
       family_sharable = false if family_sharable.nil?
 
+      availability = fetch_iap_availability(iap_id: iap["id"]) || {}
+
       meta = {
-        "type"             => type,
-        "reference_name"   => iap.dig("attributes", "name"),
-        "customer_price"   => fetch_iap_price_tier(iap_id: iap["id"]),
-        "family_shareable" => family_sharable,
+        "type"                         => type,
+        "reference_name"               => iap.dig("attributes", "name"),
+        "customer_price"               => fetch_iap_price_tier(iap_id: iap["id"]),
+        "territories"                  => availability["territories"] || [],
+        "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
+        "family_shareable"             => family_sharable,
       }
       File.write(File.join(product_dir, "product.json"), JSON.pretty_generate(meta))
 
@@ -1239,6 +1243,38 @@ platform :ios do
   rescue Spaceship::UnexpectedResponse => e
     raise unless e.message =~ /already exists|cannot create another/i
     # Already set — no-op
+  end
+
+  # Reads the IAP's current availability — territory list +
+  # availableInNewTerritories flag — for the sync direction.
+  # GET /v2/inAppPurchases/<id>/inAppPurchaseAvailability with
+  # ?include=availableTerritories. Apple caps the page size at 50, so
+  # we follow the JSON:API `links.next` cursor until exhausted.
+  # Returns { "territories" => [<alpha3>, ...], "available_in_new_territories" => bool }
+  # or nil if Apple has no availability resource for this IAP.
+  def fetch_iap_availability(iap_id:)
+    resp = iap_client.get("v2/inAppPurchases/#{iap_id}/inAppPurchaseAvailability",
+                          { "include" => "availableTerritories", "limit[availableTerritories]" => 50 }).body
+    return nil unless resp["data"]
+
+    territories = (resp["included"] || [])
+      .select { |x| x["type"] == "territories" }
+      .map { |x| x["id"] }
+
+    next_url = resp.dig("data", "relationships", "availableTerritories", "links", "next")
+    while next_url
+      page = iap_client.get(next_url).body
+      territories.concat((page["data"] || []).map { |x| x["id"] })
+      next_url = page.dig("links", "next")
+    end
+
+    {
+      "territories"                  => territories.uniq.sort,
+      "available_in_new_territories" => resp.dig("data", "attributes", "availableInNewTerritories"),
+    }
+  rescue Spaceship::UnexpectedResponse => e
+    return nil if e.message =~ /404|not found/i
+    raise
   end
 
   # 3-step Apple asset upload pattern. JWT-verified 2026-05-07.
