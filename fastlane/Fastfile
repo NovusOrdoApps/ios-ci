@@ -826,284 +826,44 @@ platform :ios do
     new_id
   end
 
-
   # ──────────────────────────────────────────────
-  # update_accessibility
+  # update_app_info / fetch_app_info
   #
-  # Push App Accessibility URL (apps.attributes.accessibilityUrl) and
-  # per-deviceFamily AccessibilityDeclaration records. Both are in
-  # Apple's public ASC API but `deliver` skips them; no Spaceship
-  # model class for declarations, so we use the request client directly.
+  # Single source of truth for the simple (PATCH-able / single-resource)
+  # fields on the App Information page. Reads metadata/AppInfo/app_info.jsonc.
+  # Each section is optional — the lane only touches sections present
+  # in the file. Idempotent: only PATCHes when state diverges.
   #
-  # Recon: docs/recon/accessibility.md in NovusOrdoApps/asc-ops-workflow.
+  # Sections currently supported:
+  #   accessibility_url        → PATCH /v1/apps/<id>.attributes.accessibilityUrl
+  #   subscription_status_urls → PATCH /v1/apps/<id>.attributes.subscriptionStatusUrl{,ForSandbox,Version,VersionForSandbox}
+  #   content_rights           → PATCH /v1/apps/<id>.attributes.contentRightsDeclaration
+  #   eula                     → CREATE/UPDATE/DELETE /v1/endUserLicenseAgreements
   #
-  # Input layout (JSONC, parsed inline):
+  # Stays out of scope (separate lanes; different complexity):
+  #   - Accessibility declarations (per-deviceFamily matrix; update_accessibility lane)
+  #   - Age rating questionnaire (matrix; not yet implemented)
+  #   - Per-locale fields (name, subtitle, privacy_url) — handled by metadata pipeline
   #
-  #   metadata/AppInfo/accessibility.jsonc:
-  #   {
-  #     "accessibility_url": "https://app.example/accessibility",
-  #     "declarations": {
-  #       "IPHONE": {
-  #         "supports_voiceover":                       true,
-  #         "supports_larger_text":                     true,
-  #         "supports_captions":                        false,
-  #         "supports_dark_interface":                  true,
-  #         "supports_audio_descriptions":              null,
-  #         "supports_differentiate_without_color_alone": null,
-  #         "supports_reduced_motion":                  null,
-  #         "supports_sufficient_contrast":             null,
-  #         "supports_voice_control":                   null
-  #       }
-  #     }
-  #   }
+  # The per-section lanes (update_accessibility, update_eula,
+  # update_subscription_status_url) are kept around for backwards
+  # compatibility with existing app repos. New repos should use this
+  # unified lane via ios-app-info.yml.
   #
-  # Idempotent: GET existing → diff per device family → POST/PATCH/DELETE
-  # as needed. URL is a single PATCH.
-  #
-  # Usage: bundle exec fastlane update_accessibility input_path:metadata/AppInfo/accessibility.jsonc
+  # Usage:
+  #   bundle exec fastlane update_app_info input_path:/path/to/app_info.jsonc
+  #   bundle exec fastlane fetch_app_info  output_path:/path/to/repo/metadata/AppInfo
   # ──────────────────────────────────────────────
-  lane :update_accessibility do |options|
+  lane :update_app_info do |options|
     require "spaceship"
 
     input_path = options[:input_path]
     UI.user_error!("Missing input_path") if input_path.to_s.empty?
-    UI.user_error!("Accessibility input file not found: #{input_path}") unless File.exist?(input_path)
-
-    spec = parse_jsonc(File.read(input_path))
-
-    app_store_connect_api_key(
-      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
-      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
-      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
-    )
-
-    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
-
-    client = Spaceship::ConnectAPI.client.tunes_request_client
-
-    # 1. Accessibility URL (PATCH on the apps resource)
-    if spec.key?("accessibility_url")
-      desired_url = spec["accessibility_url"]
-      current_url = app.respond_to?(:accessibility_url) ? app.accessibility_url : nil
-
-      if current_url == desired_url
-        UI.message(":: accessibilityUrl already #{desired_url.inspect}")
-      else
-        client.patch("v1/apps/#{app.id}", {
-          data: { type: "apps", id: app.id, attributes: { accessibilityUrl: desired_url } },
-        })
-        UI.success(":: accessibilityUrl: #{current_url.inspect} → #{desired_url.inspect}")
-      end
-    end
-
-    # 2. Accessibility Declarations (per deviceFamily)
-    declarations = spec["declarations"] || {}
-    return UI.success("Accessibility URL updated; no declarations specified") if declarations.empty?
-
-    existing_resp = client.get("v1/apps/#{app.id}/accessibilityDeclarations", { "limit" => 50 })
-    existing = (existing_resp.body["data"] || []).map { |d|
-      { id: d["id"], device_family: d.dig("attributes", "deviceFamily"), attrs: d["attributes"] || {} }
-    }
-
-    # Map JSONC snake_case → API camelCase
-    snake_to_camel = ->(s) {
-      parts = s.to_s.split("_")
-      parts[0] + parts[1..].map(&:capitalize).join
-    }
-
-    declarations.each do |device_family, fields|
-      api_attrs = { "deviceFamily" => device_family }
-      fields.each { |k, v| api_attrs[snake_to_camel.call(k)] = v }
-
-      existing_decl = existing.find { |e| e[:device_family] == device_family }
-
-      if existing_decl
-        # PATCH the existing one
-        client.patch("v1/accessibilityDeclarations/#{existing_decl[:id]}", {
-          data: { type: "accessibilityDeclarations", id: existing_decl[:id], attributes: api_attrs.except("deviceFamily") },
-        })
-        UI.message(":: PATCHed accessibility declaration for #{device_family} (#{existing_decl[:id]})")
-      else
-        # POST a new one
-        client.post("v1/accessibilityDeclarations", {
-          data: {
-            type: "accessibilityDeclarations",
-            attributes: api_attrs,
-            relationships: { app: { data: { type: "apps", id: app.id } } },
-          },
-        })
-        UI.message(":: POSTed accessibility declaration for #{device_family}")
-      end
-    end
-
-    # Optionally DELETE declarations for device families absent from JSONC
-    # (uncomment if "remove" semantics are wanted):
-    # existing.each do |e|
-    #   next if declarations.key?(e[:device_family])
-    #   client.delete("v1/accessibilityDeclarations/#{e[:id]}")
-    #   UI.message(":: DELETEd stray declaration for #{e[:device_family]}")
-    # end
-
-    UI.success("Accessibility synced for #{app.bundle_id}: #{declarations.size} device family declarations")
-  end
-
-  # ──────────────────────────────────────────────
-  # update_eula
-  #
-  # Push custom End User License Agreement for one app. The territory
-  # relationship is IMMUTABLE post-create (Apple returns 403 on PATCH);
-  # any territory-list change forces DELETE-then-recreate.
-  #
-  # Recon: docs/recon/eula.md in NovusOrdoApps/asc-ops-workflow.
-  #
-  # Input layout (JSONC, parsed inline):
-  #
-  #   metadata/AppInfo/eula.jsonc:
-  #   {
-  #     "agreement_text": "Your custom EULA text...",
-  #     "territories": ["USA", "GBR", "DEU"]    // ISO 3166-1 alpha-3
-  #   }
-  #
-  # Set the file to {} or delete it to remove the custom EULA.
-  #
-  # Usage: bundle exec fastlane update_eula input_path:metadata/AppInfo/eula.jsonc
-  # ──────────────────────────────────────────────
-  lane :update_eula do |options|
-    require "spaceship"
-
-    input_path = options[:input_path]
-    UI.user_error!("Missing input_path") if input_path.to_s.empty?
-    UI.user_error!("EULA input file not found: #{input_path}") unless File.exist?(input_path)
-
-    spec = parse_jsonc(File.read(input_path))
-
-    app_store_connect_api_key(
-      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
-      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
-      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
-    )
-
-    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
-
-    client = Spaceship::ConnectAPI.client.tunes_request_client
-
-    desired_text = spec["agreement_text"]
-    desired_territories = (spec["territories"] || []).sort
-
-    existing_resp = client.get("v1/apps/#{app.id}/endUserLicenseAgreement")
-    existing_eula = existing_resp.body["data"]   # nil if no custom EULA
-
-    # Cleanup case: empty / absent JSONC AND existing EULA → DELETE
-    if (desired_text.to_s.empty? || desired_territories.empty?) && existing_eula
-      client.delete("v1/endUserLicenseAgreements/#{existing_eula['id']}")
-      UI.success(":: Deleted custom EULA #{existing_eula['id']}")
-      next
-    end
-
-    if desired_text.to_s.empty? || desired_territories.empty?
-      UI.message(":: No EULA configured (agreement_text and/or territories empty); nothing to do")
-      next
-    end
-
-    if existing_eula
-      existing_id = existing_eula["id"]
-      existing_text = existing_eula.dig("attributes", "agreementText")
-
-      # Get current territories via the relationship endpoint
-      tr_resp = client.get("v1/endUserLicenseAgreements/#{existing_id}/relationships/territories", { "limit" => 200 })
-      existing_territories = (tr_resp.body["data"] || []).map { |t| t["id"] }.sort
-
-      if existing_territories != desired_territories
-        # Territories immutable → DELETE + recreate
-        UI.important(":: Territory list changed (#{existing_territories} → #{desired_territories}); recreating EULA")
-        client.delete("v1/endUserLicenseAgreements/#{existing_id}")
-        existing_eula = nil   # fall through to POST below
-      elsif existing_text != desired_text
-        # Same territories, different text → PATCH
-        client.patch("v1/endUserLicenseAgreements/#{existing_id}", {
-          data: { type: "endUserLicenseAgreements", id: existing_id, attributes: { agreementText: desired_text } },
-        })
-        UI.success(":: Updated EULA text on #{existing_id}")
-        next
-      else
-        UI.message(":: EULA already at desired state; no change")
-        next
-      end
-    end
-
-    # POST a new one
-    client.post("v1/endUserLicenseAgreements", {
-      data: {
-        type: "endUserLicenseAgreements",
-        attributes: { agreementText: desired_text },
-        relationships: {
-          app: { data: { type: "apps", id: app.id } },
-          territories: { data: desired_territories.map { |t| { type: "territories", id: t } } },
-        },
-      },
-    })
-    UI.success(":: Created custom EULA covering #{desired_territories.join(', ')}")
-  end
-
-  # ──────────────────────────────────────────────
-  # update_subscription_status_url
-  #
-  # Sets Apple's "Server-to-Server Notifications" URL pair on the App
-  # resource via PATCH /v1/apps/<id>. These URLs receive auto-renewable
-  # subscription state changes from Apple. Production + sandbox URLs are
-  # set independently; either can be omitted.
-  #
-  # Apple requires the matching `version` ("V1" | "V2") to be set when
-  # a URL is set. We default to V2 (current) when a URL is given without
-  # an explicit version. To clear a URL, set it to null.
-  #
-  # Source: PATCH /v1/apps/<id> attributes:
-  #   subscriptionStatusUrl
-  #   subscriptionStatusUrlForSandbox
-  #   subscriptionStatusUrlVersion           ("V1" | "V2")
-  #   subscriptionStatusUrlVersionForSandbox ("V1" | "V2")
-  #
-  # Usage: bundle exec fastlane update_subscription_status_url \
-  #          input_path:/path/to/subscription_status_url.jsonc
-  # ──────────────────────────────────────────────
-  lane :update_subscription_status_url do |options|
-    require "spaceship"
-
-    input_path = options[:input_path]
-    UI.user_error!("Missing input_path") if input_path.to_s.empty?
-    UI.user_error!("Subscription status URL input file not found: #{input_path}") unless File.exist?(input_path)
+    UI.user_error!("App info file not found: #{input_path}") unless File.exist?(input_path)
 
     spec = parse_jsonc(File.read(input_path))
     if spec.empty?
-      UI.message(":: subscription_status_url.jsonc is empty; nothing to do")
-      next
-    end
-
-    valid_versions = %w[V1 V2].freeze
-    desired = {}
-
-    if spec.key?("production_url")
-      desired["subscriptionStatusUrl"] = spec["production_url"]
-      version = spec["production_version"] || (spec["production_url"] ? "V2" : nil)
-      if version && !valid_versions.include?(version)
-        UI.user_error!("production_version must be one of #{valid_versions} (got #{version.inspect})")
-      end
-      desired["subscriptionStatusUrlVersion"] = version
-    end
-
-    if spec.key?("sandbox_url")
-      desired["subscriptionStatusUrlForSandbox"] = spec["sandbox_url"]
-      version = spec["sandbox_version"] || (spec["sandbox_url"] ? "V2" : nil)
-      if version && !valid_versions.include?(version)
-        UI.user_error!("sandbox_version must be one of #{valid_versions} (got #{version.inspect})")
-      end
-      desired["subscriptionStatusUrlVersionForSandbox"] = version
-    end
-
-    if desired.empty?
-      UI.message(":: No production_url / sandbox_url keys present; nothing to do")
+      UI.message(":: app_info.jsonc is empty; nothing to do")
       next
     end
 
@@ -1116,23 +876,170 @@ platform :ios do
     app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
     client = Spaceship::ConnectAPI.client.tunes_request_client
 
-    # Read current state to keep the lane idempotent.
-    current_resp = client.get("v1/apps/#{app.id}", {
-      "fields[apps]" => "subscriptionStatusUrl,subscriptionStatusUrlForSandbox,subscriptionStatusUrlVersion,subscriptionStatusUrlVersionForSandbox",
-    })
-    current = current_resp.body.dig("data", "attributes") || {}
+    # Compute desired App attributes from the app-level sections.
+    # All four ride on the same PATCH /v1/apps/<id> call so we coalesce
+    # them into a single diff to avoid 4 round trips.
+    desired_app_attrs = {}
 
-    diff = desired.reject { |k, v| current[k] == v }
-    if diff.empty?
-      UI.success(":: All subscription-status URL fields already at desired state; no PATCH sent")
-      next
+    if spec.key?("accessibility_url")
+      desired_app_attrs["accessibilityUrl"] = spec["accessibility_url"]
     end
 
-    client.patch("v1/apps/#{app.id}", {
-      data: { type: "apps", id: app.id, attributes: diff },
-    })
+    if spec.key?("subscription_status_urls")
+      sub = spec["subscription_status_urls"] || {}
+      valid = %w[V1 V2].freeze
+      if sub.key?("production_url")
+        desired_app_attrs["subscriptionStatusUrl"] = sub["production_url"]
+        v = sub["production_version"] || (sub["production_url"] ? "V2" : nil)
+        UI.user_error!("subscription_status_urls.production_version must be V1|V2") if v && !valid.include?(v)
+        desired_app_attrs["subscriptionStatusUrlVersion"] = v
+      end
+      if sub.key?("sandbox_url")
+        desired_app_attrs["subscriptionStatusUrlForSandbox"] = sub["sandbox_url"]
+        v = sub["sandbox_version"] || (sub["sandbox_url"] ? "V2" : nil)
+        UI.user_error!("subscription_status_urls.sandbox_version must be V1|V2") if v && !valid.include?(v)
+        desired_app_attrs["subscriptionStatusUrlVersionForSandbox"] = v
+      end
+    end
 
-    diff.each { |k, v| UI.success(":: #{k}: #{current[k].inspect} → #{v.inspect}") }
+    if spec.key?("content_rights")
+      cr = spec["content_rights"] || {}
+      if cr.key?("uses_third_party_content")
+        # Apple's enum: USES_THIRD_PARTY_CONTENT | DOES_NOT_USE_THIRD_PARTY_CONTENT
+        flag = cr["uses_third_party_content"] ? true : false
+        desired_app_attrs["contentRightsDeclaration"] =
+          flag ? "USES_THIRD_PARTY_CONTENT" : "DOES_NOT_USE_THIRD_PARTY_CONTENT"
+      end
+    end
+
+    unless desired_app_attrs.empty?
+      # Read current state to keep idempotent
+      field_list = desired_app_attrs.keys.join(",")
+      current = client.get("v1/apps/#{app.id}", { "fields[apps]" => field_list }).body.dig("data", "attributes") || {}
+      diff = desired_app_attrs.reject { |k, v| current[k] == v }
+
+      if diff.empty?
+        UI.message(":: All app attributes already at desired state; no PATCH sent")
+      else
+        client.patch("v1/apps/#{app.id}", {
+          data: { type: "apps", id: app.id, attributes: diff },
+        })
+        diff.each { |k, v| UI.success(":: #{k}: #{current[k].inspect} → #{v.inspect}") }
+      end
+    end
+
+    # EULA section — separate resource family (endUserLicenseAgreements).
+    # Mirrors update_eula lane: text-only changes PATCH; territory
+    # changes force DELETE+POST (territories are immutable).
+    if spec.key?("eula")
+      eula        = spec["eula"] || {}
+      desired_text = eula["agreement_text"]
+      desired_terr = (eula["territories"] || []).sort
+
+      existing_eula = client.get("v1/apps/#{app.id}/endUserLicenseAgreement").body["data"]
+
+      cleanup_case = (desired_text.to_s.empty? || desired_terr.empty?) && existing_eula
+      if cleanup_case
+        client.delete("v1/endUserLicenseAgreements/#{existing_eula['id']}")
+        UI.success(":: eula: deleted custom EULA #{existing_eula['id']}")
+      elsif desired_text.to_s.empty? || desired_terr.empty?
+        UI.message(":: eula: no custom agreement configured; nothing to do")
+      elsif existing_eula
+        existing_id   = existing_eula["id"]
+        existing_text = existing_eula.dig("attributes", "agreementText")
+        tr_resp       = client.get("v1/endUserLicenseAgreements/#{existing_id}/relationships/territories", { "limit" => 200 })
+        existing_terr = (tr_resp.body["data"] || []).map { |t| t["id"] }.sort
+
+        if existing_terr != desired_terr
+          UI.important(":: eula: territory list changed; recreating")
+          client.delete("v1/endUserLicenseAgreements/#{existing_id}")
+          client.post("v1/endUserLicenseAgreements", {
+            data: {
+              type: "endUserLicenseAgreements",
+              attributes: { agreementText: desired_text },
+              relationships: {
+                app: { data: { type: "apps", id: app.id } },
+                territories: { data: desired_terr.map { |t| { type: "territories", id: t } } },
+              },
+            },
+          })
+          UI.success(":: eula: created with #{desired_terr.size} territory(ies)")
+        elsif existing_text != desired_text
+          client.patch("v1/endUserLicenseAgreements/#{existing_id}", {
+            data: { type: "endUserLicenseAgreements", id: existing_id, attributes: { agreementText: desired_text } },
+          })
+          UI.success(":: eula: text updated on #{existing_id}")
+        else
+          UI.message(":: eula: already at desired state")
+        end
+      else
+        client.post("v1/endUserLicenseAgreements", {
+          data: {
+            type: "endUserLicenseAgreements",
+            attributes: { agreementText: desired_text },
+            relationships: {
+              app: { data: { type: "apps", id: app.id } },
+              territories: { data: desired_terr.map { |t| { type: "territories", id: t } } },
+            },
+          },
+        })
+        UI.success(":: eula: created custom EULA covering #{desired_terr.size} territory(ies)")
+      end
+    end
+
+    UI.success("Done")
+  end
+
+  lane :fetch_app_info do |options|
+    require "spaceship"
+    require "fileutils"
+
+    output_path = options[:output_path] || "."
+    FileUtils.mkdir_p(output_path)
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    client = Spaceship::ConnectAPI.client.tunes_request_client
+
+    fields = "accessibilityUrl,subscriptionStatusUrl,subscriptionStatusUrlForSandbox,subscriptionStatusUrlVersion,subscriptionStatusUrlVersionForSandbox,contentRightsDeclaration"
+    attrs = client.get("v1/apps/#{app.id}", { "fields[apps]" => fields }).body.dig("data", "attributes") || {}
+
+    out = {}
+    out["accessibility_url"] = attrs["accessibilityUrl"] if attrs.key?("accessibilityUrl")
+
+    if attrs.values_at("subscriptionStatusUrl", "subscriptionStatusUrlForSandbox").any?
+      out["subscription_status_urls"] = {
+        "production_url"     => attrs["subscriptionStatusUrl"],
+        "sandbox_url"        => attrs["subscriptionStatusUrlForSandbox"],
+        "production_version" => attrs["subscriptionStatusUrlVersion"],
+        "sandbox_version"    => attrs["subscriptionStatusUrlVersionForSandbox"],
+      }
+    end
+
+    if attrs["contentRightsDeclaration"]
+      out["content_rights"] = {
+        "uses_third_party_content" => attrs["contentRightsDeclaration"] == "USES_THIRD_PARTY_CONTENT",
+      }
+    end
+
+    eula_resp = client.get("v1/apps/#{app.id}/endUserLicenseAgreement").body
+    if eula_resp["data"]
+      eula_id = eula_resp.dig("data", "id")
+      tr_resp = client.get("v1/endUserLicenseAgreements/#{eula_id}/relationships/territories", { "limit" => 200 })
+      out["eula"] = {
+        "agreement_text" => eula_resp.dig("data", "attributes", "agreementText"),
+        "territories"    => (tr_resp.body["data"] || []).map { |t| t["id"] }.sort,
+      }
+    end
+
+    out_file = File.join(output_path, "app_info.json")
+    File.write(out_file, JSON.pretty_generate(out))
+    UI.success(":: Wrote #{out.keys.size} section(s) to #{out_file}: #{out.keys.join(', ')}")
   end
 
   # ── IAP helpers (private to update_iap / fetch_iap) ──────────
