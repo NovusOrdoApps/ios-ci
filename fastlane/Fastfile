@@ -1391,6 +1391,595 @@ platform :ios do
     })
   end
 
+  # ──────────────────────────────────────────────
+  # update_subscription
+  #
+  # Upserts auto-renewable subscription groups + their subscriptions
+  # against Apple's /v1/subscriptions* endpoints. Idempotent — matches
+  # groups by reference_name and subs by product_id; creates if absent,
+  # PATCHes attribute drift otherwise. After each subscription is in
+  # shape (localized, priced, availability set, optional screenshot),
+  # the lane submits the WHOLE GROUP for review via
+  # POST /v1/subscriptionGroupSubmissions (group-level submission is
+  # an Apple choice — different from IAPs which submit one at a time).
+  #
+  # Source layout (per group):
+  #   <group_folder>/
+  #     group.jsonc                 # { reference_name }
+  #     Text/defaults/info.jsonc    # shared { name, custom_app_name }
+  #     Text/<locale>/info.jsonc    # per-locale overrides
+  #     <product_id>/
+  #       subscription.jsonc        # period, group_level, family_shareable,
+  #                                 # customer_price, territories, ...
+  #       review_screenshot.png     # 640×920 PNG (optional but rec'd)
+  #       Text/defaults/info.jsonc  # shared { name, description }
+  #       Text/<locale>/info.jsonc  # per-locale overrides
+  #
+  # Usage: bundle exec fastlane update_subscription input_path:/tmp/sub-normalized.json
+  # ──────────────────────────────────────────────
+  lane :update_subscription do |options|
+    require "spaceship"
+    require "json"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Subscription input file not found: #{input_path}") unless File.exist?(input_path)
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    source = JSON.parse(File.read(input_path))
+    groups = source.fetch("groups", [])
+    UI.user_error!("No subscription groups in #{input_path}") if groups.empty?
+
+    existing_groups = {}
+    list_app_subscription_groups(app.id).each do |g|
+      existing_groups[g.dig("attributes", "referenceName")] = g
+    end
+    UI.message(":: App has #{existing_groups.size} existing subscription group(s) on ASC")
+
+    warnings = []
+
+    groups.each do |group|
+      ref = group.fetch("reference_name")
+      grp = existing_groups[ref]
+
+      if grp.nil?
+        UI.message(":: Creating subscription group '#{ref}'")
+        grp = create_subscription_group(app_id: app.id, reference_name: ref)
+      else
+        UI.message(":: Subscription group '#{ref}' already exists (id=#{grp['id']})")
+      end
+
+      group_id = grp["id"]
+      sync_subscription_group_localizations(group_id: group_id, ref: ref, source_locs: group.fetch("localizations", {}))
+
+      existing_subs = {}
+      list_group_subscriptions(group_id).each do |s|
+        existing_subs[s.dig("attributes", "productId")] = s
+      end
+
+      group.fetch("subscriptions", []).each do |sub|
+        pid = sub.fetch("product_id")
+        existing = existing_subs[pid]
+
+        if existing.nil?
+          UI.message(":: Creating subscription '#{pid}' (period=#{sub['subscription_period']})")
+          existing = create_subscription(
+            group_id: group_id,
+            product_id: pid,
+            name: sub.fetch("reference_name"),
+            family_sharable: sub.fetch("family_shareable", true),
+            subscription_period: sub.fetch("subscription_period"),
+            group_level: sub.fetch("group_level", 1),
+            review_note: sub["review_note"],
+          )
+        else
+          attrs = {}
+          attrs[:name]          = sub["reference_name"]    if existing.dig("attributes", "name") != sub["reference_name"]
+          if !existing.dig("attributes", "familySharable").nil? && existing.dig("attributes", "familySharable") != sub["family_shareable"]
+            attrs[:familySharable] = sub["family_shareable"]
+          end
+          attrs[:groupLevel]    = sub["group_level"]       if sub["group_level"] && existing.dig("attributes", "groupLevel") != sub["group_level"]
+          attrs[:reviewNote]    = sub["review_note"]       if sub.key?("review_note") && existing.dig("attributes", "reviewNote") != sub["review_note"]
+          # subscriptionPeriod is immutable post-create — Apple errors on PATCH attempt
+          unless attrs.empty?
+            UI.message(":: Updating subscription '#{pid}' (#{attrs.keys.join(', ')})")
+            update_subscription_attrs(sub_id: existing["id"], attrs: attrs)
+          end
+        end
+
+        sub_id = existing["id"]
+        sync_subscription_localizations(sub_id: sub_id, pid: pid, source_locs: sub.fetch("localizations"))
+
+        if sub["customer_price"]
+          begin
+            sync_subscription_price(sub_id: sub_id, customer_price: sub["customer_price"])
+          rescue StandardError => e
+            warnings << "#{pid}: price update failed: #{e.message}"
+          end
+        end
+
+        if sub["territories"]
+          begin
+            territories = sub["territories"]
+            territories = fetch_all_apple_territories if territories == "ALL"
+            sync_subscription_availability(
+              sub_id: sub_id,
+              territories: territories,
+              available_in_new_territories: sub.fetch("available_in_new_territories", true)
+            )
+          rescue StandardError => e
+            warnings << "#{pid}: availability update failed: #{e.message}"
+          end
+        end
+
+        if sub["review_screenshot"]
+          begin
+            upload_subscription_review_screenshot(sub_id: sub_id, path: sub["review_screenshot"])
+          rescue StandardError => e
+            warnings << "#{pid}: review screenshot upload failed: #{e.message}"
+          end
+        end
+      end
+
+      # Group-level submission — submits every subscription in the
+      # group at once. Best-effort; subscriptions sit in
+      # MISSING_METADATA until Apple validates everything (which can
+      # take some time even after we've set price/availability/
+      # screenshot/localizations). If the submission errors here,
+      # re-running the workflow later usually succeeds.
+      begin
+        submit_subscription_group_for_review(group_id: group_id)
+        UI.success(":: Submitted group '#{ref}' for review")
+      rescue StandardError => e
+        warnings << "group '#{ref}': submission deferred — #{e.message}. Re-run after subs reach READY_TO_SUBMIT."
+      end
+    end
+
+    if warnings.any?
+      warnings.each { |w| UI.important(":: WARNING: #{w}") }
+      UI.success("Done — #{warnings.size} warning(s) above (non-fatal).")
+    else
+      UI.success("Done — all subscriptions synced cleanly.")
+    end
+  end
+
+  # ──────────────────────────────────────────────
+  # fetch_subscription
+  #
+  # Mirror of update_subscription. Dumps every auto-renewable
+  # subscription group + its subscriptions to a flat layout that
+  # reverse_transform_subscription.rb consumes:
+  #   {output_path}/{group_ref}/group.json
+  #   {output_path}/{group_ref}/Text/{locale}/info.json
+  #   {output_path}/{group_ref}/{product_id}/subscription.json
+  #   {output_path}/{group_ref}/{product_id}/review_screenshot.png  (if present)
+  #   {output_path}/{group_ref}/{product_id}/Text/{locale}/info.json
+  #
+  # Schema parity with update_subscription is a contract — every push
+  # field must be populated here so a synced PR can be re-pushed.
+  #
+  # Usage: bundle exec fastlane fetch_subscription output_path:/tmp/sub-dump
+  # ──────────────────────────────────────────────
+  lane :fetch_subscription do |options|
+    require "spaceship"
+    require "fileutils"
+    require "json"
+    require "open-uri"
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    output_path = options[:output_path] || "."
+    FileUtils.mkdir_p(output_path)
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    groups = list_app_subscription_groups(app.id)
+    written_groups = 0
+
+    groups.each do |grp|
+      ref = grp.dig("attributes", "referenceName")
+      group_dir = File.join(output_path, ref)
+      FileUtils.mkdir_p(group_dir)
+
+      File.write(
+        File.join(group_dir, "group.json"),
+        JSON.pretty_generate({ "reference_name" => ref })
+      )
+
+      text_dir = File.join(group_dir, "Text")
+      FileUtils.mkdir_p(text_dir)
+      list_subscription_group_localizations(grp["id"]).each do |loc|
+        locale = loc.dig("attributes", "locale")
+        next if locale.to_s.empty?
+        locale_dir = File.join(text_dir, locale)
+        FileUtils.mkdir_p(locale_dir)
+        File.write(
+          File.join(locale_dir, "info.json"),
+          JSON.pretty_generate({
+            "name"            => loc.dig("attributes", "name"),
+            "custom_app_name" => loc.dig("attributes", "customAppName"),
+          })
+        )
+      end
+
+      list_group_subscriptions(grp["id"]).each do |sub|
+        pid = sub.dig("attributes", "productId")
+        sub_dir = File.join(group_dir, pid)
+        FileUtils.mkdir_p(sub_dir)
+
+        availability = fetch_subscription_availability(sub_id: sub["id"]) || {}
+        territories  = availability["territories"] || []
+        all_apple    = fetch_all_apple_territories
+        territories_field = (territories.size == all_apple.size && territories == all_apple) ? "ALL" : territories
+
+        meta = {
+          "type"                         => "auto_renewable_subscription",
+          "reference_name"               => sub.dig("attributes", "name"),
+          "subscription_period"          => sub.dig("attributes", "subscriptionPeriod"),
+          "family_shareable"             => sub.dig("attributes", "familySharable") == true,
+          "group_level"                  => sub.dig("attributes", "groupLevel"),
+          "review_note"                  => sub.dig("attributes", "reviewNote"),
+          "customer_price"               => fetch_subscription_current_price(sub_id: sub["id"]),
+          "territories"                  => territories_field,
+          "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
+        }
+        File.write(File.join(sub_dir, "subscription.json"), JSON.pretty_generate(meta))
+
+        loc_text_dir = File.join(sub_dir, "Text")
+        FileUtils.mkdir_p(loc_text_dir)
+        list_subscription_localizations(sub["id"]).each do |loc|
+          locale = loc.dig("attributes", "locale")
+          next if locale.to_s.empty?
+          locale_dir = File.join(loc_text_dir, locale)
+          FileUtils.mkdir_p(locale_dir)
+          File.write(
+            File.join(locale_dir, "info.json"),
+            JSON.pretty_generate({
+              "name"        => loc.dig("attributes", "name"),
+              "description" => loc.dig("attributes", "description"),
+            })
+          )
+        end
+
+        begin
+          download_subscription_review_screenshot(sub_id: sub["id"], dest_path: File.join(sub_dir, "review_screenshot.png"))
+        rescue StandardError => e
+          UI.important(":: #{pid}: could not download review screenshot: #{e.message}")
+        end
+
+        UI.message(":: Dumped subscription #{pid}")
+      end
+
+      written_groups += 1
+      UI.message(":: Dumped group '#{ref}'")
+    end
+
+    UI.success("Dumped #{written_groups} subscription group(s) to #{output_path}.")
+  end
+
+  # ── Subscription helpers (private to update_subscription / fetch_subscription) ──
+
+  # GET /v1/apps/<id>/subscriptionGroups
+  def list_app_subscription_groups(app_id)
+    resp = iap_client.get("v1/apps/#{app_id}/subscriptionGroups", { "limit" => 200 }).body
+    resp["data"] || []
+  end
+
+  # POST /v1/subscriptionGroups
+  def create_subscription_group(app_id:, reference_name:)
+    resp = iap_client.post("v1/subscriptionGroups", {
+      data: {
+        type: "subscriptionGroups",
+        attributes: { referenceName: reference_name },
+        relationships: { app: { data: { type: "apps", id: app_id } } },
+      }
+    })
+    resp.body["data"]
+  end
+
+  # GET /v1/subscriptionGroups/<id>/subscriptionGroupLocalizations
+  def list_subscription_group_localizations(group_id)
+    resp = iap_client.get("v1/subscriptionGroups/#{group_id}/subscriptionGroupLocalizations",
+                          { "limit" => 200 }).body
+    resp["data"] || []
+  end
+
+  # Upserts group localizations by locale. Same patch-or-create dance
+  # as IAP localizations.
+  def sync_subscription_group_localizations(group_id:, ref:, source_locs:)
+    existing = {}
+    list_subscription_group_localizations(group_id).each do |loc|
+      existing[loc.dig("attributes", "locale")] = loc
+    end
+
+    source_locs.each do |locale, fields|
+      name      = fields["name"]
+      custom    = fields["custom_app_name"]
+      if existing[locale]
+        loc_id = existing[locale]["id"]
+        attrs  = {}
+        attrs[:name]          = name   if name && existing[locale].dig("attributes", "name") != name
+        attrs[:customAppName] = custom if custom && existing[locale].dig("attributes", "customAppName") != custom
+        next if attrs.empty?
+        iap_client.patch("v1/subscriptionGroupLocalizations/#{loc_id}", {
+          data: { type: "subscriptionGroupLocalizations", id: loc_id, attributes: attrs }
+        })
+        UI.message(":: group '#{ref}' / #{locale}: localization updated (#{attrs.keys.join(', ')})")
+      else
+        iap_client.post("v1/subscriptionGroupLocalizations", {
+          data: {
+            type: "subscriptionGroupLocalizations",
+            attributes: { name: name, customAppName: custom, locale: locale }.compact,
+            relationships: {
+              subscriptionGroup: { data: { type: "subscriptionGroups", id: group_id } }
+            }
+          }
+        })
+        UI.message(":: group '#{ref}' / #{locale}: localization created")
+      end
+    end
+  end
+
+  # GET /v1/subscriptionGroups/<id>/subscriptions
+  def list_group_subscriptions(group_id)
+    resp = iap_client.get("v1/subscriptionGroups/#{group_id}/subscriptions",
+                          { "limit" => 200 }).body
+    resp["data"] || []
+  end
+
+  # POST /v1/subscriptions
+  # subscription_period must be one of: ONE_WEEK, ONE_MONTH, TWO_MONTHS,
+  # THREE_MONTHS, SIX_MONTHS, ONE_YEAR. Period is IMMUTABLE post-create.
+  def create_subscription(group_id:, product_id:, name:, family_sharable:, subscription_period:, group_level:, review_note: nil)
+    attrs = {
+      productId:          product_id,
+      name:               name,
+      familySharable:     family_sharable,
+      subscriptionPeriod: subscription_period,
+      groupLevel:         group_level,
+    }
+    attrs[:reviewNote] = review_note if review_note
+
+    resp = iap_client.post("v1/subscriptions", {
+      data: {
+        type: "subscriptions",
+        attributes: attrs,
+        relationships: { group: { data: { type: "subscriptionGroups", id: group_id } } },
+      }
+    })
+    resp.body["data"]
+  end
+
+  def update_subscription_attrs(sub_id:, attrs:)
+    resp = iap_client.patch("v1/subscriptions/#{sub_id}", {
+      data: { type: "subscriptions", id: sub_id, attributes: attrs }
+    })
+    resp.body["data"]
+  end
+
+  # GET /v1/subscriptions/<id>/subscriptionLocalizations
+  def list_subscription_localizations(sub_id)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/subscriptionLocalizations",
+                          { "limit" => 200 }).body
+    resp["data"] || []
+  end
+
+  def sync_subscription_localizations(sub_id:, pid:, source_locs:)
+    existing = {}
+    list_subscription_localizations(sub_id).each do |loc|
+      existing[loc.dig("attributes", "locale")] = loc
+    end
+
+    source_locs.each do |locale, fields|
+      name = fields.fetch("name")
+      desc = fields.fetch("description")
+      if existing[locale]
+        loc_id = existing[locale]["id"]
+        attrs  = {}
+        attrs[:name]        = name if existing[locale].dig("attributes", "name") != name
+        attrs[:description] = desc if existing[locale].dig("attributes", "description") != desc
+        next if attrs.empty?
+        iap_client.patch("v1/subscriptionLocalizations/#{loc_id}", {
+          data: { type: "subscriptionLocalizations", id: loc_id, attributes: attrs }
+        })
+        UI.message(":: #{pid}/#{locale}: localization updated (#{attrs.keys.join(', ')})")
+      else
+        iap_client.post("v1/subscriptionLocalizations", {
+          data: {
+            type: "subscriptionLocalizations",
+            attributes: { name: name, description: desc, locale: locale },
+            relationships: { subscription: { data: { type: "subscriptions", id: sub_id } } }
+          }
+        })
+        UI.message(":: #{pid}/#{locale}: localization created")
+      end
+    end
+  end
+
+  # GET /v1/subscriptions/<id>/pricePoints?filter[territory]=USA
+  # Returns the matching subscriptionPricePoint resource ID for a USD
+  # customer price (e.g. "4.99"). Apple keys subscription price points
+  # by USD price in USA territory and derives equivalents elsewhere.
+  def fetch_subscription_price_point_id(sub_id:, customer_price:, territory: "USA")
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/pricePoints", {
+      "filter[territory]" => territory,
+      "limit"             => 200,
+    }).body
+    matches = (resp["data"] || []).select { |p| p.dig("attributes", "customerPrice") == customer_price }
+    if matches.empty?
+      raise "No subscription price point in #{territory} matches customerPrice=#{customer_price.inspect}"
+    end
+    matches.first["id"]
+  end
+
+  # GET /v1/subscriptions/<id>/prices?include=subscriptionPricePoint
+  # Returns the customer_price string of the current price (or nil).
+  def fetch_subscription_current_price(sub_id:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/prices",
+                          { "include" => "subscriptionPricePoint", "limit" => 10 }).body
+    point_ref = (resp["data"] || []).first&.dig("relationships", "subscriptionPricePoint", "data", "id")
+    return nil unless point_ref
+    point = (resp["included"] || []).find { |x| x["type"] == "subscriptionPricePoints" && x["id"] == point_ref }
+    point&.dig("attributes", "customerPrice")
+  rescue StandardError
+    nil
+  end
+
+  # POST /v1/subscriptionPrices — sets a price effective immediately
+  # for all territories (no `territory` relationship → Apple uses the
+  # USA equivalent for the rest via the pricing matrix). If a price
+  # already matches, this is a no-op skip.
+  def sync_subscription_price(sub_id:, customer_price:)
+    current = fetch_subscription_current_price(sub_id: sub_id)
+    return if current == customer_price
+
+    point_id = fetch_subscription_price_point_id(sub_id: sub_id, customer_price: customer_price)
+    iap_client.post("v1/subscriptionPrices", {
+      data: {
+        type: "subscriptionPrices",
+        attributes: { startDate: nil, preserveCurrentPrice: false },
+        relationships: {
+          subscription:           { data: { type: "subscriptions",           id: sub_id } },
+          subscriptionPricePoint: { data: { type: "subscriptionPricePoints", id: point_id } },
+        }
+      }
+    })
+  end
+
+  # GET /v1/subscriptions/<id>/subscriptionAvailability
+  # Two-step like IAP: get availability resource → then GET its
+  # availableTerritories (limit=200 covers all 175).
+  def fetch_subscription_availability(sub_id:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/subscriptionAvailability").body
+    return nil unless resp["data"]
+
+    avail_id = resp.dig("data", "id")
+    flag = resp.dig("data", "attributes", "availableInNewTerritories")
+
+    terr_resp = iap_client.get(
+      "v1/subscriptionAvailabilities/#{avail_id}/availableTerritories",
+      { "limit" => 200 }
+    ).body
+    territories = (terr_resp["data"] || []).map { |x| x["id"] }.uniq.sort
+
+    {
+      "territories"                  => territories,
+      "available_in_new_territories" => flag,
+    }
+  rescue Spaceship::UnexpectedResponse => e
+    return nil if e.message =~ /404|not found/i
+    raise
+  end
+
+  # POST /v1/subscriptionAvailabilities
+  def sync_subscription_availability(sub_id:, territories:, available_in_new_territories: true)
+    iap_client.post("v1/subscriptionAvailabilities", {
+      data: {
+        type: "subscriptionAvailabilities",
+        attributes: { availableInNewTerritories: available_in_new_territories },
+        relationships: {
+          subscription:         { data: { type: "subscriptions", id: sub_id } },
+          availableTerritories: { data: territories.map { |t| { type: "territories", id: t } } }
+        }
+      }
+    })
+  rescue Spaceship::UnexpectedResponse => e
+    raise unless e.message =~ /already exists|cannot create another/i
+    # Already set — no-op
+  end
+
+  # 3-step asset upload pattern (mirrors IAP):
+  #   1. POST /v1/subscriptionAppStoreReviewScreenshots with fileSize+fileName
+  #   2. PUT bytes via uploadOperations
+  #   3. PATCH commit with sourceFileChecksum + uploaded:true
+  def upload_subscription_review_screenshot(sub_id:, path:)
+    require "digest"
+    require "net/http"
+    require "uri"
+    raise "screenshot file not found: #{path}" unless File.file?(path)
+
+    bytes     = File.binread(path)
+    file_size = bytes.bytesize
+    file_name = File.basename(path)
+    md5       = Digest::MD5.hexdigest(bytes)
+
+    create_resp = iap_client.post("v1/subscriptionAppStoreReviewScreenshots", {
+      data: {
+        type: "subscriptionAppStoreReviewScreenshots",
+        attributes: { fileName: file_name, fileSize: file_size },
+        relationships: { subscription: { data: { type: "subscriptions", id: sub_id } } }
+      }
+    })
+    asset_id   = create_resp.body.dig("data", "id")
+    operations = create_resp.body.dig("data", "attributes", "uploadOperations") || []
+
+    operations.each do |op|
+      uri  = URI.parse(op["url"])
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == "https")
+      req  = Net::HTTP::Put.new(uri.request_uri)
+      (op["requestHeaders"] || []).each { |h| req[h["name"]] = h["value"] }
+      offset = op["offset"] || 0
+      length = op["length"] || file_size
+      req.body = bytes[offset, length]
+      resp = http.request(req)
+      raise "PUT #{uri} failed: #{resp.code} #{resp.body}" unless resp.is_a?(Net::HTTPSuccess)
+    end
+
+    iap_client.patch("v1/subscriptionAppStoreReviewScreenshots/#{asset_id}", {
+      data: {
+        type: "subscriptionAppStoreReviewScreenshots",
+        id: asset_id,
+        attributes: { uploaded: true, sourceFileChecksum: md5 }
+      }
+    })
+  rescue Spaceship::UnexpectedResponse => e
+    # Apple keeps one screenshot per subscription; trying to create a
+    # second errors with "Screenshot already exists". Skip silently —
+    # if you need to replace, DELETE the existing one first via the
+    # ASC UI (replacement-via-API is a v2 feature).
+    raise unless e.message =~ /already exists/i
+  end
+
+  # GET /v1/subscriptions/<id>/appStoreReviewScreenshot
+  def download_subscription_review_screenshot(sub_id:, dest_path:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/appStoreReviewScreenshot").body
+    asset = resp["data"]
+    return unless asset
+
+    asset_url = asset.dig("attributes", "imageAsset", "templateUrl")
+    return unless asset_url
+
+    width  = asset.dig("attributes", "imageAsset", "width")  || 640
+    height = asset.dig("attributes", "imageAsset", "height") || 920
+    url    = asset_url.gsub("{w}", width.to_s).gsub("{h}", height.to_s).gsub("{f}", "png")
+
+    URI.open(url) do |io|
+      File.open(dest_path, "wb") { |f| f.write(io.read) }
+    end
+  end
+
+  # POST /v1/subscriptionGroupSubmissions — submits the WHOLE GROUP
+  # for review (every sub in it). Apple's grouping forces an all-at-once
+  # submission, which is actually nicer than IAP's per-resource submit.
+  def submit_subscription_group_for_review(group_id:)
+    iap_client.post("v1/subscriptionGroupSubmissions", {
+      data: {
+        type: "subscriptionGroupSubmissions",
+        relationships: { subscriptionGroup: { data: { type: "subscriptionGroups", id: group_id } } }
+      }
+    })
+  end
+
   # ── shared helper ───────────────────────────────────────────
   # Lightweight JSONC parser: strips UTF-8 BOM, // line comments
   # outside quoted strings, and trailing commas before } / ].

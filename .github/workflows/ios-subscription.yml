@@ -1,0 +1,113 @@
+# Reusable workflow: Push auto-renewable subscription groups + their
+# subscriptions to App Store Connect for one app.
+#
+# Reads metadata/Subscriptions/<group>/{group.jsonc, Text/.../, <product_id>/...}
+# from the caller repo. Mirrors the IAP pipeline:
+#   1. transform_subscription.rb validates + normalizes the source
+#      layout into a flat JSON.
+#   2. fastlane update_subscription consumes that JSON and PATCHes /
+#      POSTs against /v1/subscriptions* endpoints (groups, subs,
+#      localizations, prices, availability, screenshots, submission).
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required org secrets:
+#   CHECKOUT_PAT
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS Subscriptions (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      input_path:
+        description: "Path (relative to caller repo root) to subscription source folder"
+        required: false
+        type: string
+        default: "metadata/Subscriptions"
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      macos_runner:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-26"
+
+concurrency:
+  group: ios-subscription-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  push-subscriptions:
+    name: Push Subscriptions
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 30
+
+    env:
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+    steps:
+      - name: Checkout app/metadata repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+
+          if [ ! -d "${{ inputs.input_path }}" ] || [ -z "$(ls -A "${{ inputs.input_path }}" 2>/dev/null)" ]; then
+            echo ":: ${{ inputs.input_path }} missing or empty — nothing to do (no subscriptions configured)"
+            echo "SKIP_RUN=1" >> "$GITHUB_ENV"
+          fi
+
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+          echo ":: Input path: ${{ inputs.input_path }}"
+
+      - name: Transform subscription source → normalized JSON
+        if: env.SKIP_RUN != '1'
+        working-directory: _ci
+        run: |
+          ruby scripts/transform_subscription.rb \
+            --input  "$GITHUB_WORKSPACE/${{ inputs.input_path }}" \
+            --output "$RUNNER_TEMP/sub-normalized.json"
+
+      - name: Push subscriptions to App Store Connect
+        if: env.SKIP_RUN != '1'
+        working-directory: _ci
+        run: |
+          bundle exec fastlane update_subscription \
+            input_path:"$RUNNER_TEMP/sub-normalized.json"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
