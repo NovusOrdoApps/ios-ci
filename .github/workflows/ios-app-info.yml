@@ -5,19 +5,16 @@
 # Each section is optional — the lane only touches sections present
 # in the file. Idempotent: only PATCHes when state diverges.
 #
-# Replaces ios-accessibility.yml + ios-eula.yml + ios-subscription-status-url.yml.
 # Out of scope (separate lanes / not yet implemented):
 #   - Accessibility declarations (per-deviceFamily matrix)
 #   - Age rating questionnaire
 #   - Per-locale fields (privacy_url, name, subtitle) — handled by metadata pipeline
 #
-# Required repo secrets:
-#   APP_STORE_CONNECT_API_KEY_P8
-#   APP_STORE_CONNECT_KEY_ID
-#   APP_STORE_CONNECT_ISSUER_ID
-#
-# Required org secrets:
-#   CHECKOUT_PAT
+# Credential resolution: see .github/actions/resolve-asc-credentials.
+#   Class 1 (legacy): caller passes APP_STORE_CONNECT_* repo secrets.
+#   Class 2 (vault):  caller defines a single GitHub Environment named
+#                     after the team_slug; org-level VAULT_REPO_PAT secret
+#                     gives read access to asc-api-vault.
 #
 # Required repo variables:
 #   IOS_RELEASE_APP_BUNDLE_ID
@@ -32,6 +29,11 @@ on:
         required: false
         type: string
         default: "metadata/AppInfo/app_info.jsonc"
+      team_slug:
+        description: "Override Environment auto-detect (Class 2). Leave empty for the common case."
+        required: false
+        type: string
+        default: ""
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -54,8 +56,6 @@ jobs:
     timeout-minutes: 15
 
     env:
-      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
       APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
 
     steps:
@@ -77,11 +77,14 @@ jobs:
           bundler-cache: true
           working-directory: _ci
 
-      - name: Write API key
-        run: |
-          mkdir -p "$RUNNER_TEMP/secrets"
-          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
-          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+      - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
+        uses: ./_ci/.github/actions/resolve-asc-credentials
+        with:
+          team_slug:          ${{ inputs.team_slug }}
+          vault_pat:          ${{ secrets.VAULT_REPO_PAT }}
+          fallback_p8:        ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          fallback_key_id:    ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
 
       - name: Validate inputs
         run: |
@@ -104,4 +107,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
+        run: rm -f "$RUNNER_TEMP/asc-secrets/AuthKey.p8"

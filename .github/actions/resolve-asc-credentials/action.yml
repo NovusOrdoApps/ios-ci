@@ -1,0 +1,194 @@
+name: "Resolve ASC credentials"
+description: >-
+  Dual-mode resolver for App Store Connect API credentials. Detects whether
+  the calling repo is Class 1 (legacy: repo secrets) or Class 2 (vault) by
+  counting GitHub Environments, then exports ASC_KEY_P8_PATH +
+  APP_STORE_CONNECT_KEY_ID + APP_STORE_CONNECT_ISSUER_ID + IOS_RELEASE_TEAM_ID
+  to $GITHUB_ENV so downstream lane invocations work transparently.
+
+  Class detection (no input needed for the common cases):
+    0 environments  → Class 1 → use repo secrets fallbacks
+    1 environment   → Class 2 → that environment's name IS the team_slug
+                                → checkout vault, read team's API key + team_id
+    2+ environments → caller MUST pass `team_slug` input explicitly
+
+  Class 1 fallbacks expected as inputs:
+    fallback_p8        — APP_STORE_CONNECT_API_KEY_P8 secret value
+    fallback_key_id    — APP_STORE_CONNECT_KEY_ID secret value
+    fallback_issuer_id — APP_STORE_CONNECT_ISSUER_ID secret value
+    fallback_team_id   — IOS_RELEASE_TEAM_ID variable value (optional, only
+                         needed by lanes that do code signing)
+
+  Class 2 vault access requires:
+    vault_pat — VAULT_REPO_PAT (org-level secret) with read on asc-api-vault
+
+inputs:
+  team_slug:
+    description: "Override Environment auto-detect. Required when 2+ Environments exist."
+    required: false
+    default: ""
+  vault_pat:
+    description: "PAT with read access to asc-api-vault. Required when team_slug resolves to non-empty."
+    required: false
+    default: ""
+  vault_repo:
+    description: "Vault repo (owner/name)."
+    required: false
+    default: "NovusOrdoApps/asc-api-vault"
+  fallback_p8:
+    description: "Class 1: APP_STORE_CONNECT_API_KEY_P8 secret content."
+    required: false
+    default: ""
+  fallback_key_id:
+    description: "Class 1: APP_STORE_CONNECT_KEY_ID."
+    required: false
+    default: ""
+  fallback_issuer_id:
+    description: "Class 1: APP_STORE_CONNECT_ISSUER_ID."
+    required: false
+    default: ""
+  fallback_team_id:
+    description: "Class 1: IOS_RELEASE_TEAM_ID."
+    required: false
+    default: ""
+  gh_token:
+    description: "GH token for the auto-detect API call. Defaults to github.token."
+    required: false
+    default: ""
+
+outputs:
+  team_slug:
+    description: "Resolved team slug ('' for Class 1)."
+    value: ${{ steps.resolve.outputs.team_slug }}
+  class:
+    description: "'class1' (legacy repo secrets) or 'class2' (vault)."
+    value: ${{ steps.resolve.outputs.class }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect class + resolve team_slug
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token != '' && inputs.gh_token || github.token }}
+        EXPLICIT_SLUG: ${{ inputs.team_slug }}
+      run: |
+        set -e
+        if [ -n "$EXPLICIT_SLUG" ]; then
+          echo "team_slug=$EXPLICIT_SLUG"  >> "$GITHUB_OUTPUT"
+          echo "class=class2"              >> "$GITHUB_OUTPUT"
+          echo ":: Class 2 (explicit team_slug=$EXPLICIT_SLUG)"
+          exit 0
+        fi
+
+        # Auto-detect via Environments listing on the caller repo.
+        envs_json=$(gh api "repos/$GITHUB_REPOSITORY/environments" --jq '.environments[].name' 2>/dev/null || true)
+        env_count=$(echo "$envs_json" | grep -c . || true)
+
+        case "$env_count" in
+          0)
+            echo "team_slug="            >> "$GITHUB_OUTPUT"
+            echo "class=class1"          >> "$GITHUB_OUTPUT"
+            echo ":: Class 1 (no Environments → use repo secrets)"
+            ;;
+          1)
+            slug=$(echo "$envs_json" | tr -d '[:space:]')
+            echo "team_slug=$slug"       >> "$GITHUB_OUTPUT"
+            echo "class=class2"          >> "$GITHUB_OUTPUT"
+            echo ":: Class 2 (Environment '$slug' → vault)"
+            ;;
+          *)
+            echo "::error::Multiple GitHub Environments found ($env_count). Pass 'team_slug' input explicitly to disambiguate. Detected: $envs_json"
+            exit 1
+            ;;
+        esac
+
+    - name: Class 1 — write repo-secret API key to disk
+      if: steps.resolve.outputs.class == 'class1'
+      shell: bash
+      env:
+        FALLBACK_P8:        ${{ inputs.fallback_p8 }}
+        FALLBACK_KEY_ID:    ${{ inputs.fallback_key_id }}
+        FALLBACK_ISSUER_ID: ${{ inputs.fallback_issuer_id }}
+        FALLBACK_TEAM_ID:   ${{ inputs.fallback_team_id }}
+      run: |
+        set -e
+        if [ -z "$FALLBACK_P8" ] || [ -z "$FALLBACK_KEY_ID" ] || [ -z "$FALLBACK_ISSUER_ID" ]; then
+          echo "::error::Class 1 detected but fallback_p8/key_id/issuer_id inputs are missing. Pass them from APP_STORE_CONNECT_* secrets."
+          exit 1
+        fi
+
+        mkdir -p "$RUNNER_TEMP/asc-secrets"
+        printf '%s' "$FALLBACK_P8" > "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+        chmod 600 "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+
+        {
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+          echo "APP_STORE_CONNECT_KEY_ID=$FALLBACK_KEY_ID"
+          echo "APP_STORE_CONNECT_ISSUER_ID=$FALLBACK_ISSUER_ID"
+        } >> "$GITHUB_ENV"
+        if [ -n "$FALLBACK_TEAM_ID" ]; then
+          echo "IOS_RELEASE_TEAM_ID=$FALLBACK_TEAM_ID" >> "$GITHUB_ENV"
+        fi
+        echo ":: Class 1 credentials staged at $RUNNER_TEMP/asc-secrets/AuthKey.p8"
+
+    - name: Class 2 — sparse-checkout vault + export team's credentials
+      if: steps.resolve.outputs.class == 'class2'
+      shell: bash
+      env:
+        VAULT_PAT:  ${{ inputs.vault_pat }}
+        VAULT_REPO: ${{ inputs.vault_repo }}
+        TEAM_SLUG:  ${{ steps.resolve.outputs.team_slug }}
+      run: |
+        set -e
+        if [ -z "$VAULT_PAT" ]; then
+          echo "::error::Class 2 detected (Environment '$TEAM_SLUG') but vault_pat input is empty. Pass VAULT_REPO_PAT (org secret)."
+          exit 1
+        fi
+
+        rm -rf "$RUNNER_TEMP/_vault"
+        git clone --depth 1 --filter=blob:none --sparse \
+          "https://x-access-token:${VAULT_PAT}@github.com/${VAULT_REPO}.git" \
+          "$RUNNER_TEMP/_vault" >/dev/null 2>&1
+        ( cd "$RUNNER_TEMP/_vault" && git sparse-checkout set "teams/$TEAM_SLUG" >/dev/null )
+
+        team_dir="$RUNNER_TEMP/_vault/teams/$TEAM_SLUG"
+        if [ ! -d "$team_dir" ]; then
+          echo "::error::Vault has no entry for team '$TEAM_SLUG'. Run bootstrap-team-key first."
+          exit 1
+        fi
+
+        key_id=$(cat "$team_dir/key_id.txt")
+        issuer_id=$(cat "$team_dir/issuer_id.txt")
+        p8=$(ls "$team_dir"/AuthKey_*.p8 | head -1)
+
+        mkdir -p "$RUNNER_TEMP/asc-secrets"
+        cp "$p8" "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+        chmod 600 "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+
+        {
+          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+          echo "APP_STORE_CONNECT_KEY_ID=$key_id"
+          echo "APP_STORE_CONNECT_ISSUER_ID=$issuer_id"
+        } >> "$GITHUB_ENV"
+
+        # team_id.txt is written by the extended bootstrap_team_key lane
+        # (post-2026-05-07). Older vault entries don't have it; lanes that
+        # don't need IOS_RELEASE_TEAM_ID won't notice.
+        if [ -f "$team_dir/team_id.txt" ]; then
+          team_id=$(cat "$team_dir/team_id.txt")
+          echo "IOS_RELEASE_TEAM_ID=$team_id" >> "$GITHUB_ENV"
+          echo ":: Class 2 credentials staged from vault (team=$TEAM_SLUG, key=$key_id, team_id=$team_id)"
+        else
+          echo "::warning::vault/$TEAM_SLUG/team_id.txt not present. Re-run bootstrap-team-key to populate it; release/code-signing lanes may fail."
+          echo ":: Class 2 credentials staged from vault (team=$TEAM_SLUG, key=$key_id, team_id MISSING)"
+        fi
+
+        # Wipe the vault checkout (we've copied what we need).
+        rm -rf "$RUNNER_TEMP/_vault"
+
+    - name: Cleanup hint
+      shell: bash
+      run: |
+        echo ":: Add this to your workflow's final step to clean up: rm -f \$RUNNER_TEMP/asc-secrets/AuthKey.p8"

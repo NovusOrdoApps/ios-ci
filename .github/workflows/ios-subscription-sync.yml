@@ -47,8 +47,6 @@ jobs:
       pull-requests: write
 
     env:
-      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
       APP_BUNDLE_ID: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
 
     steps:
@@ -70,11 +68,14 @@ jobs:
           bundler-cache: true
           working-directory: _ci
 
-      - name: Write API key
-        run: |
-          mkdir -p "$RUNNER_TEMP/secrets"
-          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}" > "$RUNNER_TEMP/secrets/AuthKey.p8"
-          echo "ASC_KEY_P8_PATH=$RUNNER_TEMP/secrets/AuthKey.p8" >> "$GITHUB_ENV"
+      - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
+        uses: ./_ci/.github/actions/resolve-asc-credentials
+        with:
+          team_slug:          ${{ inputs.team_slug }}
+          vault_pat:          ${{ secrets.VAULT_REPO_PAT }}
+          fallback_p8:        ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          fallback_key_id:    ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
 
       - name: Validate inputs
         run: |
@@ -141,4 +142,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f "$RUNNER_TEMP/secrets/AuthKey.p8"
+        run: rm -f "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
