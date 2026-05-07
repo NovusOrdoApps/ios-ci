@@ -431,7 +431,7 @@ platform :ios do
     # in NovusOrdoApps/asc-ops-workflow.
     if submission_info.key?("uses_idfa")
       uses_idfa = submission_info["uses_idfa"]   # true / false / null
-      Spaceship::ConnectAPI::Tunes.client.patch(
+      Spaceship::ConnectAPI.client.tunes_request_client.patch(
         "v1/appStoreVersions/#{version.id}",
         { data: { type: "appStoreVersions", id: version.id, attributes: { usesIdfa: uses_idfa } } },
       )
@@ -755,10 +755,10 @@ platform :ios do
     UI.user_error!("Missing identifier (or APP_BUNDLE_ID env)") if identifier.to_s.empty?
 
     name = options[:name] || identifier
-    platform = options[:platform] || "UNIVERSAL"   # IOS | MAC_OS | UNIVERSAL
+    platform = options[:platform] || "IOS"   # IOS | MAC_OS (Apple's REST accepts only these)
 
-    UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS | UNIVERSAL") \
-      unless %w[IOS MAC_OS UNIVERSAL].include?(platform)
+    UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS") \
+      unless %w[IOS MAC_OS].include?(platform)
 
     app_store_connect_api_key(
       key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
@@ -766,7 +766,7 @@ platform :ios do
       key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
     )
 
-    client = Spaceship::ConnectAPI::Provisioning.client
+    client = Spaceship::ConnectAPI.client.provisioning_request_client
 
     # Look for existing bundle ID by identifier (idempotency)
     existing_resp = client.get("v1/bundleIds", { "filter[identifier]" => identifier, "limit" => 1 })
@@ -774,7 +774,6 @@ platform :ios do
 
     if existing
       UI.success(":: Bundle ID already exists: #{identifier} → #{existing['id']}")
-      lane_context[SharedValues::REGISTER_BUNDLE_ID_RESOURCE_ID] = existing["id"] if defined?(SharedValues)
       next existing["id"]
     end
 
@@ -791,125 +790,6 @@ platform :ios do
     new_id
   end
 
-  # ──────────────────────────────────────────────
-  # update_data_usages
-  #
-  # Push App Privacy "Data Usage" disclosures (the privacy nutrition
-  # labels) for one app, then optionally publish them.
-  #
-  # Apple's public ASC OpenAPI does NOT document this surface; the
-  # endpoints DO exist at /v1/appDataUsages and friends, with JWT auth.
-  # Spaceship::ConnectAPI::Tunes has internal methods (post_app_data_usage,
-  # delete_app_data_usage, patch_app_data_usages_publish_state). We use
-  # them directly here, mirroring the update_iap pattern.
-  #
-  # Input layout (JSONC, parsed inline):
-  #
-  #   metadata/AppPrivacy/data_usages.jsonc:
-  #   {
-  #     "collects_data": true,                    // false → DATA_NOT_COLLECTED
-  #     "usages": [
-  #       { "category": "EMAIL_ADDRESS", "purpose": "ANALYTICS",
-  #         "protection": "DATA_LINKED_TO_YOU" },
-  #       ...
-  #     ],
-  #     "published": true                          // flip privacy details live
-  #   }
-  #
-  # Idempotent: GET existing usages → diff against JSONC → DELETE
-  # gone-tuples + POST new-tuples + leave matching ones alone. Each
-  # appDataUsage is immutable post-create; "update" = delete + recreate.
-  #
-  # Recon: docs/recon/data-usages.md in NovusOrdoApps/asc-ops-workflow.
-  #
-  # Usage: bundle exec fastlane update_data_usages input_path:metadata/AppPrivacy/data_usages.jsonc
-  # ──────────────────────────────────────────────
-  lane :update_data_usages do |options|
-    require "spaceship"
-
-    input_path = options[:input_path]
-    UI.user_error!("Missing input_path") if input_path.to_s.empty?
-    UI.user_error!("Data usages input file not found: #{input_path}") unless File.exist?(input_path)
-
-    spec = parse_jsonc(File.read(input_path))
-
-    app_store_connect_api_key(
-      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
-      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
-      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
-    )
-
-    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
-    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
-
-    desired =
-      if spec.fetch("collects_data", true)
-        Array(spec.fetch("usages", [])).map { |u|
-          { category: u.fetch("category"), purpose: u.fetch("purpose"), protection: u.fetch("protection") }
-        }
-      else
-        # Single sentinel "we collect nothing" record. Per fastlane source,
-        # the body has only the dataProtection relationship for this case.
-        [{ category: nil, purpose: nil, protection: "DATA_NOT_COLLECTED" }]
-      end
-
-    existing = Spaceship::ConnectAPI::Tunes.client.get_app_data_usages(
-      app_id: app.id,
-      includes: "category,purpose,dataProtection",
-      limit: 500,
-    ).all_pages.to_a.flat_map { |page| page.to_models }
-
-    existing_tuples = existing.map { |u|
-      {
-        id: u.id,
-        category: u.respond_to?(:category) && u.category ? u.category.id : nil,
-        purpose: u.respond_to?(:purpose) && u.purpose ? u.purpose.id : nil,
-        protection: u.respond_to?(:data_protection) && u.data_protection ? u.data_protection.id : nil,
-      }
-    }
-
-    same = lambda { |a, b| a[:category] == b[:category] && a[:purpose] == b[:purpose] && a[:protection] == b[:protection] }
-
-    to_delete = existing_tuples.reject { |e| desired.any? { |d| same.call(e, d) } }
-    to_add    = desired.reject       { |d| existing_tuples.any? { |e| same.call(e, d) } }
-
-    UI.message(":: Existing: #{existing_tuples.size} · desired: #{desired.size} · delete: #{to_delete.size} · add: #{to_add.size}")
-
-    to_delete.each do |e|
-      Spaceship::ConnectAPI::Tunes.client.delete_app_data_usage(app_data_usage_id: e[:id])
-      UI.message(":: deleted appDataUsage #{e[:id]} (#{e[:category]}/#{e[:purpose]}/#{e[:protection]})")
-    end
-
-    to_add.each do |d|
-      Spaceship::ConnectAPI::Tunes.client.post_app_data_usage(
-        app_id: app.id,
-        app_data_usage_category_id: d[:category],
-        app_data_usage_purpose_id: d[:purpose],
-        app_data_usage_protection_id: d[:protection],
-      )
-      UI.message(":: created appDataUsage #{d[:category]}/#{d[:purpose]}/#{d[:protection]}")
-    end
-
-    if spec.key?("published")
-      target_published = spec.fetch("published") ? true : false
-      pub_resp = Spaceship::ConnectAPI::Tunes.client.get_app_data_usages_publish_state(app_id: app.id)
-      pub_data = pub_resp.respond_to?(:body) ? pub_resp.body["data"] : pub_resp["data"]
-      current_published = pub_data&.dig("attributes", "published")
-      pub_state_id = pub_data&.dig("id") || app.id
-
-      if current_published == target_published
-        UI.message(":: Publish state already #{current_published.inspect} — no change")
-      else
-        Spaceship::ConnectAPI::Tunes.client.patch_app_data_usages_publish_state(
-          app_data_usages_publish_state_id: pub_state_id,
-          published: target_published,
-        )
-        UI.success(":: Published state changed: #{current_published.inspect} → #{target_published.inspect}")
-      end
-    end
-
-    UI.success("Data usages synced for #{app.bundle_id}: #{desired.size} declared")
-  end
 
   # ──────────────────────────────────────────────
   # update_accessibility
@@ -964,7 +844,7 @@ platform :ios do
     app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
-    client = Spaceship::ConnectAPI::Tunes.client
+    client = Spaceship::ConnectAPI.client.tunes_request_client
 
     # 1. Accessibility URL (PATCH on the apps resource)
     if spec.key?("accessibility_url")
@@ -1071,7 +951,7 @@ platform :ios do
     app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
-    client = Spaceship::ConnectAPI::Tunes.client
+    client = Spaceship::ConnectAPI.client.tunes_request_client
 
     desired_text = spec["agreement_text"]
     desired_territories = (spec["territories"] || []).sort
@@ -1182,7 +1062,7 @@ platform :ios do
   #   iap.dig("attributes", "state")              → "MISSING_METADATA" / "READY_TO_SUBMIT" / etc.
 
   def iap_client
-    Spaceship::ConnectAPI::Tunes.client
+    Spaceship::ConnectAPI.client.tunes_request_client
   end
 
   # GET /v1/apps/<id>/inAppPurchasesV2 — list all IAPs for an app
