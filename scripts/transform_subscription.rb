@@ -233,6 +233,23 @@ group_dirs.each do |group_folder|
       errors << "#{group_folder}/#{product_id}: customer_price must be a USD-price string (e.g. \"4.99\"), got #{customer_price.inspect}"
     end
 
+    # Optional per-territory price overrides on top of customer_price.
+    # Keys = ISO 3166-1 alpha-3, values = local-currency price strings
+    # (Apple accepts integers without decimals for currencies like JPY).
+    territory_prices = sub_meta["territory_prices"]
+    if territory_prices && !territory_prices.is_a?(Hash)
+      errors << "#{group_folder}/#{product_id}: territory_prices must be an object {alpha3: \"price\"}, got #{territory_prices.class}"
+    elsif territory_prices
+      territory_prices.each do |t, p|
+        unless t.is_a?(String) && t.match?(/\A[A-Z]{3}\z/)
+          errors << "#{group_folder}/#{product_id}: territory_prices key #{t.inspect} is not a valid ISO 3166-1 alpha-3 code"
+        end
+        unless p.is_a?(String) && p.match?(/\A\d+(\.\d{1,2})?\z/)
+          errors << "#{group_folder}/#{product_id}: territory_prices[#{t}] must be a price string (e.g. \"5.99\" or \"650\"), got #{p.inspect}"
+        end
+      end
+    end
+
     territories = sub_meta["territories"]
     if territories.is_a?(String)
       if territories != "ALL"
@@ -275,6 +292,7 @@ group_dirs.each do |group_folder|
       "family_shareable"             => family_sharable,
       "review_note"                  => review_note.empty? ? nil : review_note,
       "customer_price"               => customer_price,
+      "territory_prices"             => territory_prices || {},
       "territories"                  => territories,
       "available_in_new_territories" => available_in_new_territories,
       "review_screenshot"            => screenshot_path,

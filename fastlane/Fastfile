@@ -1550,7 +1550,22 @@ platform :ios do
           begin
             sync_subscription_price(sub_id: sub_id, customer_price: sub["customer_price"])
           rescue StandardError => e
-            warnings << "#{pid}: price update failed: #{e.message}"
+            warnings << "#{pid}: base price update failed: #{e.message}"
+          end
+        end
+
+        # Per-territory price overrides on top of customer_price (USD base).
+        # Each entry POSTs a SubscriptionPrice with the matching local-currency
+        # price point + the territory rel; idempotent (skipped if Apple already
+        # has that exact (territory, price) combination).
+        # NOTE: this lane is additive — removing a territory from the file does
+        # NOT clear an existing override on Apple. To remove an override, set
+        # it to the same value as customer_price (Apple replaces it).
+        (sub["territory_prices"] || {}).each do |territory, price|
+          begin
+            sync_subscription_price(sub_id: sub_id, customer_price: price, territory: territory)
+          rescue StandardError => e
+            warnings << "#{pid}: #{territory} price override failed: #{e.message}"
           end
         end
 
@@ -1671,6 +1686,15 @@ platform :ios do
         all_apple    = fetch_all_apple_territories
         territories_field = (territories.size == all_apple.size && territories == all_apple) ? "ALL" : territories
 
+        # Apple stores subscription prices as one SubscriptionPrice per
+        # (sub, territory) — there is no separate "base, no-territory"
+        # concept. The lane treats USD = USA as the canonical anchor:
+        # customer_price round-trips as the USA price; everything else
+        # goes into territory_prices.
+        all_prices       = fetch_subscription_all_prices(sub_id: sub["id"])
+        base_price       = all_prices["USA"] || all_prices[nil]
+        territory_prices = all_prices.reject { |k, _| k.nil? || k == "USA" }   # {} if no overrides
+
         meta = {
           "type"                         => "auto_renewable_subscription",
           "reference_name"               => sub.dig("attributes", "name"),
@@ -1678,7 +1702,8 @@ platform :ios do
           "family_shareable"             => sub.dig("attributes", "familySharable") == true,
           "group_level"                  => sub.dig("attributes", "groupLevel"),
           "review_note"                  => sub.dig("attributes", "reviewNote"),
-          "customer_price"               => fetch_subscription_current_price(sub_id: sub["id"]),
+          "customer_price"               => base_price,
+          "territory_prices"             => territory_prices,    # {} when no overrides
           "territories"                  => territories_field,
           "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
         }
@@ -1859,48 +1884,95 @@ platform :ios do
   # Returns the matching subscriptionPricePoint resource ID for a USD
   # customer price (e.g. "4.99"). Apple keys subscription price points
   # by USD price in USA territory and derives equivalents elsewhere.
+  # Find Apple's subscriptionPricePoint id for a (territory, customer_price)
+  # tuple. Apple keys price points by territory + currency; each territory's
+  # price-point list can be hundreds of entries (USA has ~800), so we
+  # paginate via JSON:API links.next until we either find the match or
+  # exhaust the list.
   def fetch_subscription_price_point_id(sub_id:, customer_price:, territory: "USA")
-    resp = iap_client.get("v1/subscriptions/#{sub_id}/pricePoints", {
-      "filter[territory]" => territory,
-      "limit"             => 200,
-    }).body
-    matches = (resp["data"] || []).select { |p| p.dig("attributes", "customerPrice") == customer_price }
-    if matches.empty?
-      raise "No subscription price point in #{territory} matches customerPrice=#{customer_price.inspect}"
+    next_url = "v1/subscriptions/#{sub_id}/pricePoints"
+    params   = { "filter[territory]" => territory, "limit" => 200 }
+
+    loop do
+      resp = if next_url.start_with?("http")
+               # Apple returns absolute URLs for cursor pagination; strip the base.
+               uri = URI.parse(next_url)
+               iap_client.get("#{uri.path}?#{uri.query}".sub(%r{\A/}, "")).body
+             else
+               iap_client.get(next_url, params).body
+             end
+      params = nil
+
+      match = (resp["data"] || []).find { |p| p.dig("attributes", "customerPrice") == customer_price }
+      return match["id"] if match
+
+      next_url = resp.dig("links", "next")
+      break unless next_url
     end
-    matches.first["id"]
+
+    raise "No subscription price point in #{territory} matches customerPrice=#{customer_price.inspect}"
   end
 
   # GET /v1/subscriptions/<id>/prices?include=subscriptionPricePoint
-  # Returns the customer_price string of the current price (or nil).
-  def fetch_subscription_current_price(sub_id:)
-    resp = iap_client.get("v1/subscriptions/#{sub_id}/prices",
-                          { "include" => "subscriptionPricePoint", "limit" => 10 }).body
-    point_ref = (resp["data"] || []).first&.dig("relationships", "subscriptionPricePoint", "data", "id")
-    return nil unless point_ref
-    point = (resp["included"] || []).find { |x| x["type"] == "subscriptionPricePoints" && x["id"] == point_ref }
-    point&.dig("attributes", "customerPrice")
+  # Returns a hash of territory→customer_price for every price set on
+  # the sub. Key nil means "the base price" (no territory rel — Apple
+  # derives equivalents for all unlisted territories from this).
+  # Used both by sync (to skip already-correct prices) and by fetch
+  # (to populate territory_prices in the round-trip dump).
+  def fetch_subscription_all_prices(sub_id:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/prices", {
+      "include" => "subscriptionPricePoint,territory",
+      "limit"   => 200,
+    }).body
+    included_points = ((resp["included"] || []).select { |x| x["type"] == "subscriptionPricePoints" })
+                        .each_with_object({}) { |x, h| h[x["id"]] = x.dig("attributes", "customerPrice") }
+
+    out = {}
+    (resp["data"] || []).each do |price|
+      point_id    = price.dig("relationships", "subscriptionPricePoint", "data", "id")
+      territory   = price.dig("relationships", "territory", "data", "id")  # nil if base price
+      customer_p  = included_points[point_id]
+      out[territory] = customer_p if customer_p
+    end
+    out
   rescue StandardError
-    nil
+    {}
   end
 
-  # POST /v1/subscriptionPrices — sets a price effective immediately
-  # for all territories (no `territory` relationship → Apple uses the
-  # USA equivalent for the rest via the pricing matrix). If a price
-  # already matches, this is a no-op skip.
-  def sync_subscription_price(sub_id:, customer_price:)
-    current = fetch_subscription_current_price(sub_id: sub_id)
-    return if current == customer_price
+  # Backwards-compat wrapper — returns just the base price.
+  def fetch_subscription_current_price(sub_id:)
+    fetch_subscription_all_prices(sub_id: sub_id)[nil]
+  end
 
-    point_id = fetch_subscription_price_point_id(sub_id: sub_id, customer_price: customer_price)
+  # POST /v1/subscriptionPrices — sets a price for the subscription.
+  # Without `territory:` → applies as the base price (Apple derives
+  # equivalents for unlisted territories via its pricing matrix).
+  # With `territory:` → overrides the price for that specific territory
+  # only. customer_price is the local-currency string for that territory
+  # (e.g. "5.99" for DEU/EUR, "650" for JPN/JPY no-decimal).
+  # Idempotent: skips POST if the current price for that territory
+  # (or base) already matches.
+  def sync_subscription_price(sub_id:, customer_price:, territory: nil)
+    current = fetch_subscription_all_prices(sub_id: sub_id)
+    return if current[territory] == customer_price
+
+    point_id = fetch_subscription_price_point_id(
+      sub_id: sub_id,
+      customer_price: customer_price,
+      territory: territory || "USA",
+    )
+
+    rels = {
+      subscription:           { data: { type: "subscriptions",           id: sub_id   } },
+      subscriptionPricePoint: { data: { type: "subscriptionPricePoints", id: point_id } },
+    }
+    rels[:territory] = { data: { type: "territories", id: territory } } if territory
+
     iap_client.post("v1/subscriptionPrices", {
       data: {
         type: "subscriptionPrices",
         attributes: { startDate: nil, preserveCurrentPrice: false },
-        relationships: {
-          subscription:           { data: { type: "subscriptions",           id: sub_id } },
-          subscriptionPricePoint: { data: { type: "subscriptionPricePoints", id: point_id } },
-        }
+        relationships: rels,
       }
     })
   end
