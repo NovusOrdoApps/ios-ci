@@ -284,6 +284,9 @@ group_dirs.each do |group_folder|
     screenshot_path = File.join(sub_path, "review_screenshot.png")
     screenshot_path = nil unless File.file?(screenshot_path)
 
+    promo_image_path = File.join(sub_path, "promotional_image.png")
+    promo_image_path = nil unless File.file?(promo_image_path)
+
     subscriptions << {
       "product_id"                   => product_id,
       "reference_name"               => sub_ref,
@@ -296,6 +299,7 @@ group_dirs.each do |group_folder|
       "territories"                  => territories,
       "available_in_new_territories" => available_in_new_territories,
       "review_screenshot"            => screenshot_path,
+      "promotional_image"            => promo_image_path,
       "localizations"                => sub_localizations,
     }
   end

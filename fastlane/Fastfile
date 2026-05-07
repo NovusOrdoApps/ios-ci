@@ -1590,6 +1590,14 @@ platform :ios do
             warnings << "#{pid}: review screenshot upload failed: #{e.message}"
           end
         end
+
+        if sub["promotional_image"]
+          begin
+            upload_subscription_promotional_image(sub_id: sub_id, path: sub["promotional_image"])
+          rescue StandardError => e
+            warnings << "#{pid}: promotional image upload failed: #{e.message}"
+          end
+        end
       end
 
       # Group-level submission — submits every subscription in the
@@ -1729,6 +1737,12 @@ platform :ios do
           download_subscription_review_screenshot(sub_id: sub["id"], dest_path: File.join(sub_dir, "review_screenshot.png"))
         rescue StandardError => e
           UI.important(":: #{pid}: could not download review screenshot: #{e.message}")
+        end
+
+        begin
+          download_subscription_promotional_image(sub_id: sub["id"], dest_path: File.join(sub_dir, "promotional_image.png"))
+        rescue StandardError => e
+          UI.important(":: #{pid}: could not download promotional image: #{e.message}")
         end
 
         UI.message(":: Dumped subscription #{pid}")
@@ -2088,6 +2102,83 @@ platform :ios do
     URI.open(url) do |io|
       File.open(dest_path, "wb") { |f| f.write(io.read) }
     end
+  end
+
+  # POST /v1/subscriptionImages — promotional / marketing artwork
+  # shown in the subscription management sheet and Apple's upgrade UI.
+  # Distinct from the App Review screenshot: review screenshot is for
+  # Apple's reviewer (640×920), this one is shown to actual customers.
+  # Same 3-step asset upload pattern.
+  #
+  # Apple stores at most a handful of images per sub (no fixed limit
+  # in the spec). For v1 we treat it as one image per sub: idempotent
+  # via "already exists" rescue on conflicting POST.
+  def upload_subscription_promotional_image(sub_id:, path:)
+    require "digest"
+    require "net/http"
+    require "uri"
+    raise "promotional image file not found: #{path}" unless File.file?(path)
+
+    bytes     = File.binread(path)
+    file_size = bytes.bytesize
+    file_name = File.basename(path)
+    md5       = Digest::MD5.hexdigest(bytes)
+
+    create_resp = iap_client.post("v1/subscriptionImages", {
+      data: {
+        type: "subscriptionImages",
+        attributes: { fileName: file_name, fileSize: file_size },
+        relationships: { subscription: { data: { type: "subscriptions", id: sub_id } } }
+      }
+    })
+    asset_id   = create_resp.body.dig("data", "id")
+    operations = create_resp.body.dig("data", "attributes", "uploadOperations") || []
+
+    operations.each do |op|
+      uri  = URI.parse(op["url"])
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == "https")
+      req  = Net::HTTP::Put.new(uri.request_uri)
+      (op["requestHeaders"] || []).each { |h| req[h["name"]] = h["value"] }
+      offset = op["offset"] || 0
+      length = op["length"] || file_size
+      req.body = bytes[offset, length]
+      resp = http.request(req)
+      raise "PUT #{uri} failed: #{resp.code} #{resp.body}" unless resp.is_a?(Net::HTTPSuccess)
+    end
+
+    iap_client.patch("v1/subscriptionImages/#{asset_id}", {
+      data: {
+        type: "subscriptionImages",
+        id: asset_id,
+        attributes: { uploaded: true, sourceFileChecksum: md5 }
+      }
+    })
+  rescue Spaceship::UnexpectedResponse => e
+    raise unless e.message =~ /already exists/i
+    # Apple holds at most one promotional image per sub via this lane.
+    # To replace, delete via ASC UI first (replacement-via-API is v2).
+  end
+
+  # GET /v1/subscriptions/<id>/images — downloads the FIRST image
+  # (Apple may store multiple but the lane only manages one). Returns
+  # the URL it downloaded from, or nil if no image exists.
+  def download_subscription_promotional_image(sub_id:, dest_path:)
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/images", { "limit" => 5 }).body
+    asset = (resp["data"] || []).first
+    return nil unless asset
+
+    asset_url = asset.dig("attributes", "imageAsset", "templateUrl")
+    return nil unless asset_url
+
+    width  = asset.dig("attributes", "imageAsset", "width")  || 1024
+    height = asset.dig("attributes", "imageAsset", "height") || 1024
+    url    = asset_url.gsub("{w}", width.to_s).gsub("{h}", height.to_s).gsub("{f}", "png")
+
+    URI.open(url) do |io|
+      File.open(dest_path, "wb") { |f| f.write(io.read) }
+    end
+    url
   end
 
   # POST /v1/subscriptionGroupSubmissions — submits the WHOLE GROUP
