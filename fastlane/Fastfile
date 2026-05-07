@@ -581,8 +581,8 @@ platform :ios do
     }.freeze
 
     existing = {}
-    Spaceship::ConnectAPI::InAppPurchaseV2.all(app_id: app.id).each do |iap|
-      existing[iap.product_id] = iap
+    list_app_iaps(app.id).each do |iap|
+      existing[iap.dig("attributes", "productId")] = iap
     end
     UI.message(":: App has #{existing.size} existing IAP(s) on ASC")
 
@@ -595,7 +595,7 @@ platform :ios do
 
       if iap.nil?
         UI.message(":: Creating IAP '#{pid}' (type=#{apple_type})")
-        iap = Spaceship::ConnectAPI::InAppPurchaseV2.create(
+        iap = create_iap(
           app_id: app.id,
           product_id: pid,
           name: product.fetch("reference_name"),
@@ -604,34 +604,38 @@ platform :ios do
         )
       else
         attrs = {}
-        attrs[:name] = product["reference_name"] if iap.name != product["reference_name"]
-        if iap.respond_to?(:family_sharable) && iap.family_sharable != product["family_shareable"]
-          attrs[:family_sharable] = product["family_shareable"]
+        if iap.dig("attributes", "name") != product["reference_name"]
+          attrs[:name] = product["reference_name"]
+        end
+        current_fs = iap.dig("attributes", "familySharable")
+        if !current_fs.nil? && current_fs != product["family_shareable"]
+          attrs[:familySharable] = product["family_shareable"]
         end
         unless attrs.empty?
           UI.message(":: Updating IAP '#{pid}' (#{attrs.keys.join(', ')})")
-          iap.update(attributes: attrs)
+          iap = update_iap_attrs(iap_id: iap["id"], attrs: attrs)
         end
       end
 
-      sync_iap_localizations(iap, pid, product.fetch("localizations"))
+      iap_id = iap["id"]
+      sync_iap_localizations(iap_id: iap_id, pid: pid, source_locs: product.fetch("localizations"))
 
       begin
-        sync_iap_price(iap, product.fetch("price_tier"))
+        sync_iap_price(iap_id: iap_id, tier: product.fetch("price_tier"))
       rescue StandardError => e
         warnings << "#{pid}: price update failed: #{e.message}"
       end
 
       if product["review_screenshot"]
         begin
-          upload_iap_review_screenshot(iap, product["review_screenshot"])
+          upload_iap_review_screenshot(iap_id: iap_id, path: product["review_screenshot"])
         rescue StandardError => e
           warnings << "#{pid}: review screenshot upload failed: #{e.message}"
         end
       end
 
       begin
-        submit_iap_for_review(iap)
+        submit_iap_for_review(iap_id: iap_id)
       rescue StandardError => e
         warnings << "#{pid}: transition to 'Ready to Submit' failed: #{e.message}"
       end
@@ -669,7 +673,7 @@ platform :ios do
 
     app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
 
-    iaps = Spaceship::ConnectAPI::InAppPurchaseV2.all(app_id: app.id)
+    iaps = list_app_iaps(app.id)
     apple_to_type = {
       "CONSUMABLE"     => "consumable",
       "NON_CONSUMABLE" => "non_consumable",
@@ -678,40 +682,49 @@ platform :ios do
     written = 0
 
     iaps.each do |iap|
-      type = apple_to_type[iap.in_app_purchase_type]
-      next unless type # skip subscriptions and other types we don't manage
+      product_id = iap.dig("attributes", "productId")
+      type = apple_to_type[iap.dig("attributes", "inAppPurchaseType")]
+      next unless type   # skip subscriptions / non-consumable / etc. we don't manage
 
-      product_dir = File.join(output_path, iap.product_id)
+      product_dir = File.join(output_path, product_id)
       FileUtils.mkdir_p(product_dir)
+
+      family_sharable = iap.dig("attributes", "familySharable")
+      family_sharable = false if family_sharable.nil?
 
       meta = {
         "type"             => type,
-        "reference_name"   => iap.name,
-        "price_tier"       => fetch_iap_price_tier(iap),
-        "family_shareable" => iap.respond_to?(:family_sharable) ? iap.family_sharable : false,
+        "reference_name"   => iap.dig("attributes", "name"),
+        "price_tier"       => fetch_iap_price_tier(iap_id: iap["id"]),
+        "family_shareable" => family_sharable,
       }
       File.write(File.join(product_dir, "product.json"), JSON.pretty_generate(meta))
 
       text_dir = File.join(product_dir, "Text")
       FileUtils.mkdir_p(text_dir)
 
-      iap.get_in_app_purchase_localizations.each do |loc|
-        locale_dir = File.join(text_dir, loc.locale)
+      list_iap_localizations(iap["id"]).each do |loc|
+        locale = loc.dig("attributes", "locale")
+        next if locale.to_s.empty?
+        locale_dir = File.join(text_dir, locale)
         FileUtils.mkdir_p(locale_dir)
         File.write(
           File.join(locale_dir, "info.json"),
-          JSON.pretty_generate({ "name" => loc.name, "description" => loc.description }),
+          JSON.pretty_generate({
+            "name"        => loc.dig("attributes", "name"),
+            "description" => loc.dig("attributes", "description"),
+          }),
         )
       end
 
       begin
-        download_iap_review_screenshot(iap, File.join(product_dir, "review_screenshot.png"))
+        download_iap_review_screenshot(iap_id: iap["id"], dest_path: File.join(product_dir, "review_screenshot.png"))
       rescue StandardError => e
-        UI.important(":: #{iap.product_id}: could not download review screenshot: #{e.message}")
+        UI.important(":: #{product_id}: could not download review screenshot: #{e.message}")
       end
 
       written += 1
-      UI.message(":: Dumped #{iap.product_id}")
+      UI.message(":: Dumped #{product_id}")
     end
 
     UI.success("Dumped #{written} IAP(s) to #{output_path}.")
@@ -1149,9 +1162,84 @@ platform :ios do
     UI.user_error!("App not found: '#{bundle_id}'\n        #{hint}")
   end
 
-  def sync_iap_localizations(iap, pid, source_locs)
+  # ── IAP V2 raw-HTTP helpers ──
+  # fastlane's Spaceship has no ConnectAPI model class for IAP V2
+  # (verified against master HEAD: zero in_app_purchase*.rb files in
+  # spaceship/lib/spaceship/connect_api/models/, and no IAP methods
+  # in connect_api/tunes/tunes.rb either). The earlier code referenced
+  # `Spaceship::ConnectAPI::InAppPurchaseV2` which doesn't exist —
+  # that's why update_iap and fetch_iap crashed. These helpers go
+  # through tunes_request_client directly with the JSON:API shapes
+  # captured against Apple's iris API on 2026-05-07.
+  #
+  # Each helper returns the raw JSON:API resource Hash (data["data"]
+  # or array of data["data"]), keyed by string accessors:
+  #   iap["id"]                              ← Apple App Store ID (numeric string)
+  #   iap.dig("attributes", "productId")
+  #   iap.dig("attributes", "name")
+  #   iap.dig("attributes", "inAppPurchaseType")  → "CONSUMABLE" / "NON_CONSUMABLE" / etc.
+  #   iap.dig("attributes", "familySharable")
+  #   iap.dig("attributes", "state")              → "MISSING_METADATA" / "READY_TO_SUBMIT" / etc.
+
+  def iap_client
+    Spaceship::ConnectAPI::Tunes.client
+  end
+
+  # GET /v1/apps/<id>/inAppPurchasesV2 — list all IAPs for an app
+  def list_app_iaps(app_id)
+    resp = iap_client.get(
+      "v1/apps/#{app_id}/inAppPurchasesV2",
+      { "limit" => 200 }
+    )
+    resp.body["data"] || []
+  end
+
+  # POST /v2/inAppPurchases — create a new IAP. Returns the resource Hash.
+  def create_iap(app_id:, product_id:, name:, in_app_purchase_type:, family_sharable: false)
+    resp = iap_client.post(
+      "v2/inAppPurchases",
+      {
+        data: {
+          type: "inAppPurchases",
+          attributes: {
+            productId: product_id,
+            name: name,
+            inAppPurchaseType: in_app_purchase_type,
+            familySharable: family_sharable,
+          },
+          relationships: { app: { data: { type: "apps", id: app_id } } },
+        },
+      }
+    )
+    resp.body["data"]
+  end
+
+  # PATCH /v2/inAppPurchases/<id> — update name / familySharable etc.
+  def update_iap_attrs(iap_id:, attrs:)
+    resp = iap_client.patch(
+      "v2/inAppPurchases/#{iap_id}",
+      {
+        data: { type: "inAppPurchases", id: iap_id, attributes: attrs },
+      }
+    )
+    resp.body["data"]
+  end
+
+  # GET /v2/inAppPurchases/<id>/inAppPurchaseLocalizations
+  def list_iap_localizations(iap_id)
+    resp = iap_client.get(
+      "v2/inAppPurchases/#{iap_id}/inAppPurchaseLocalizations",
+      { "limit" => 50 }
+    )
+    resp.body["data"] || []
+  end
+
+  def sync_iap_localizations(iap_id:, pid:, source_locs:)
     existing = {}
-    iap.get_in_app_purchase_localizations.each { |loc| existing[loc.locale] = loc }
+    list_iap_localizations(iap_id).each do |loc|
+      locale = loc.dig("attributes", "locale")
+      existing[locale] = loc
+    end
 
     source_locs.each do |locale, fields|
       name = fields.fetch("name")
@@ -1160,79 +1248,78 @@ platform :ios do
 
       if loc.nil?
         UI.message(":: #{pid}/#{locale}: creating localization")
-        iap.create_in_app_purchase_localization(attributes: {
-          locale: locale,
-          name: name,
-          description: description,
-        })
-      elsif loc.name != name || loc.description != description
+        iap_client.post(
+          "v1/inAppPurchaseLocalizations",
+          {
+            data: {
+              type: "inAppPurchaseLocalizations",
+              attributes: { locale: locale, name: name, description: description },
+              relationships: { inAppPurchaseV2: { data: { type: "inAppPurchases", id: iap_id } } },
+            },
+          }
+        )
+      elsif loc.dig("attributes", "name") != name || loc.dig("attributes", "description") != description
         UI.message(":: #{pid}/#{locale}: updating localization")
-        loc.update(attributes: { name: name, description: description })
+        iap_client.patch(
+          "v1/inAppPurchaseLocalizations/#{loc['id']}",
+          {
+            data: {
+              type: "inAppPurchaseLocalizations",
+              id: loc["id"],
+              attributes: { name: name, description: description },
+            },
+          }
+        )
       end
     end
   end
 
-  # Apple's V2 IAP pricing uses price points, not raw tier numbers. We pick
-  # the USA price point at the requested tier and let Apple derive equivalent
-  # prices for other territories via its default pricing matrix.
-  #
-  # Idempotent: if the IAP already resolves to the requested tier, do nothing.
-  # Otherwise look up the price point and create a new schedule.
-  def sync_iap_price(iap, tier)
-    return if fetch_iap_price_tier(iap) == tier
-
-    points = Spaceship::ConnectAPI::InAppPurchasePricePoint.all(
-      app_in_app_purchase_v2_id: iap.id,
-      filter: { "territory" => "USA", "priceTier" => tier.to_s },
-      limit: 1,
-    )
-    point = points.first
-    raise "no USA price point found for tier #{tier}" unless point
-
-    iap.create_in_app_purchase_price_schedule(
-      base_territory_id: "USA",
-      price_point_id: point.id,
-    )
+  # Apple's V2 IAP pricing uses price points, not raw tier numbers.
+  # The shape was not fully reconned for V2 in this rewrite — leaving
+  # as best-effort. Existing call sites already wrap in rescue so a
+  # raise here is logged as a warning and the rest of the lane continues.
+  def sync_iap_price(iap_id:, tier:)
+    raise "IAP price-tier sync not yet implemented for V2 endpoints (TODO: recon /v2/iapPriceSchedules); requested tier=#{tier}, IAP id=#{iap_id}"
   end
 
-  def upload_iap_review_screenshot(iap, path)
-    raise "screenshot file not found: #{path}" unless File.file?(path)
-
-    iap.upload_in_app_purchase_app_store_review_screenshot(path)
-  end
-
-  # Only attempt submission when the product is in a state where Apple expects
-  # one. New IAPs that still need a screenshot or pricing report a state like
-  # MISSING_METADATA / DEVELOPER_ACTION_NEEDED — those are the cases where
-  # nudging to "Ready to Submit" makes sense. For any other state (including
-  # nil on a freshly-created product) we skip and let the next push pick it up.
-  SUBMITTABLE_IAP_STATES = %w[MISSING_METADATA DEVELOPER_ACTION_NEEDED].freeze
-
-  def submit_iap_for_review(iap)
-    state = iap.respond_to?(:state) ? iap.state : nil
-    return unless SUBMITTABLE_IAP_STATES.include?(state)
-
-    iap.create_in_app_purchase_submission
-  end
-
-  def fetch_iap_price_tier(iap)
-    schedule = iap.in_app_purchase_price_schedule
-    return nil unless schedule
-
-    base_price = schedule.manual_prices&.first || schedule.automatic_prices&.first
-    base_price&.in_app_purchase_price_point&.price_tier&.to_i
+  def fetch_iap_price_tier(iap_id:)
+    # TODO: GET /v1/inAppPurchases/<id>/iapPriceSchedule then derive tier
+    # from price point. Return nil for now so reverse_transform doesn't
+    # bail on missing tier.
+    nil
   rescue StandardError
     nil
   end
 
-  def download_iap_review_screenshot(iap, dest_path)
-    screenshot = iap.respond_to?(:review_screenshot) ? iap.review_screenshot : nil
-    return unless screenshot
+  def upload_iap_review_screenshot(iap_id:, path:)
+    raise "screenshot file not found: #{path}" unless File.file?(path)
+    # TODO: V2 review screenshot upload requires a multi-step flow
+    # (POST appStoreReviewScreenshot → upload bytes to returned asset URL
+    # → commit). Not yet reconned. Caller wraps in rescue.
+    raise "IAP review screenshot upload not yet implemented for V2 endpoints"
+  end
 
-    url = screenshot.image_asset_url(type: "png") if screenshot.respond_to?(:image_asset_url)
-    return unless url
+  def download_iap_review_screenshot(iap_id:, dest_path:)
+    # TODO: GET /v2/inAppPurchases/<id>/appStoreReviewScreenshot, parse
+    # the asset URL, download bytes. Not yet reconned. fetch_iap wraps
+    # this in rescue so missing implementation = silent skip.
+  end
 
-    URI.open(url) { |remote| File.binwrite(dest_path, remote.read) }
+  # Only attempt submission when the product is in a state where Apple expects
+  # one. Apple's V2 submission endpoint shape (likely
+  # POST /v1/inAppPurchaseSubmissions) was not fully reconned; leaving as
+  # best-effort. Caller wraps in rescue.
+  SUBMITTABLE_IAP_STATES = %w[MISSING_METADATA DEVELOPER_ACTION_NEEDED].freeze
+
+  def submit_iap_for_review(iap_id:)
+    # Re-read the IAP to get its current state
+    resp = iap_client.get("v2/inAppPurchases/#{iap_id}")
+    state = resp.body.dig("data", "attributes", "state")
+    return unless SUBMITTABLE_IAP_STATES.include?(state)
+
+    # TODO: V2 submission shape — likely POST /v1/inAppPurchaseSubmissions
+    # with relationship to the IAP. Not yet reconned.
+    raise "IAP submit-for-review not yet implemented for V2 endpoints (current state=#{state})"
   end
 
   # ── shared helper ───────────────────────────────────────────
