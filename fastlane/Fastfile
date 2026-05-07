@@ -928,6 +928,48 @@ platform :ios do
       end
     end
 
+    # Subscription grace period — singleton resource on the app
+    # (/v1/apps/<id>/subscriptionGracePeriod GET → /v1/subscriptionGracePeriods/<id> PATCH).
+    # When a subscriber's renewal payment fails, Apple retries for the
+    # configured duration and the subscriber retains access during it.
+    if spec.key?("subscription_grace_period")
+      gp_in = spec["subscription_grace_period"] || {}
+      valid_durations = %w[THREE_DAYS SIXTEEN_DAYS TWENTY_EIGHT_DAYS].freeze
+      valid_renewal   = %w[ALL_RENEWALS PAID_TO_PAID_ONLY].freeze
+
+      if gp_in["duration"] && !valid_durations.include?(gp_in["duration"])
+        UI.user_error!("subscription_grace_period.duration must be one of #{valid_durations} (got #{gp_in['duration'].inspect})")
+      end
+      if gp_in["renewal_type"] && !valid_renewal.include?(gp_in["renewal_type"])
+        UI.user_error!("subscription_grace_period.renewal_type must be one of #{valid_renewal} (got #{gp_in['renewal_type'].inspect})")
+      end
+
+      gp_resp = client.get("v1/apps/#{app.id}/subscriptionGracePeriod").body
+      gp_data = gp_resp["data"]
+      if gp_data.nil?
+        UI.important(":: subscription_grace_period: no grace-period resource exists for this app yet; Apple usually creates one automatically when the app first has subs. Skipping.")
+      else
+        gp_id   = gp_data["id"]
+        gp_curr = gp_data["attributes"] || {}
+
+        desired_gp = {}
+        desired_gp["optIn"]        = gp_in["production_opt_in"] if gp_in.key?("production_opt_in")
+        desired_gp["sandboxOptIn"] = gp_in["sandbox_opt_in"]    if gp_in.key?("sandbox_opt_in")
+        desired_gp["duration"]     = gp_in["duration"]          if gp_in.key?("duration")
+        desired_gp["renewalType"]  = gp_in["renewal_type"]      if gp_in.key?("renewal_type")
+
+        diff_gp = desired_gp.reject { |k, v| gp_curr[k] == v }
+        if diff_gp.empty?
+          UI.message(":: subscription_grace_period: already at desired state")
+        else
+          client.patch("v1/subscriptionGracePeriods/#{gp_id}", {
+            data: { type: "subscriptionGracePeriods", id: gp_id, attributes: diff_gp }
+          })
+          diff_gp.each { |k, v| UI.success(":: subscription_grace_period.#{k}: #{gp_curr[k].inspect} → #{v.inspect}") }
+        end
+      end
+    end
+
     # EULA section — separate resource family (endUserLicenseAgreements).
     # Mirrors update_eula lane: text-only changes PATCH; territory
     # changes force DELETE+POST (territories are immutable).
@@ -1027,6 +1069,17 @@ platform :ios do
       }
     end
 
+    gp_resp = client.get("v1/apps/#{app.id}/subscriptionGracePeriod").body
+    if gp_resp["data"]
+      gp_attrs = gp_resp.dig("data", "attributes") || {}
+      out["subscription_grace_period"] = {
+        "production_opt_in" => gp_attrs["optIn"],
+        "sandbox_opt_in"    => gp_attrs["sandboxOptIn"],
+        "duration"          => gp_attrs["duration"],
+        "renewal_type"      => gp_attrs["renewalType"],
+      }
+    end
+
     eula_resp = client.get("v1/apps/#{app.id}/endUserLicenseAgreement").body
     if eula_resp["data"]
       eula_id = eula_resp.dig("data", "id")
@@ -1040,94 +1093,6 @@ platform :ios do
     out_file = File.join(output_path, "app_info.json")
     File.write(out_file, JSON.pretty_generate(out))
     UI.success(":: Wrote #{out.keys.size} section(s) to #{out_file}: #{out.keys.join(', ')}")
-  end
-
-  # ──────────────────────────────────────────────
-  # update_subscription_status_url
-  #
-  # Sets Apple's "Server-to-Server Notifications" URL pair on the App
-  # resource via PATCH /v1/apps/<id>. These URLs receive auto-renewable
-  # subscription state changes from Apple. Production + sandbox URLs are
-  # set independently; either can be omitted.
-  #
-  # Apple requires the matching `version` ("V1" | "V2") to be set when
-  # a URL is set. We default to V2 (current) when a URL is given without
-  # an explicit version. To clear a URL, set it to null.
-  #
-  # Source: PATCH /v1/apps/<id> attributes:
-  #   subscriptionStatusUrl
-  #   subscriptionStatusUrlForSandbox
-  #   subscriptionStatusUrlVersion           ("V1" | "V2")
-  #   subscriptionStatusUrlVersionForSandbox ("V1" | "V2")
-  #
-  # Usage: bundle exec fastlane update_subscription_status_url \
-  #          input_path:/path/to/subscription_status_url.jsonc
-  # ──────────────────────────────────────────────
-  lane :update_subscription_status_url do |options|
-    require "spaceship"
-
-    input_path = options[:input_path]
-    UI.user_error!("Missing input_path") if input_path.to_s.empty?
-    UI.user_error!("Subscription status URL input file not found: #{input_path}") unless File.exist?(input_path)
-
-    spec = parse_jsonc(File.read(input_path))
-    if spec.empty?
-      UI.message(":: subscription_status_url.jsonc is empty; nothing to do")
-      next
-    end
-
-    valid_versions = %w[V1 V2].freeze
-    desired = {}
-
-    if spec.key?("production_url")
-      desired["subscriptionStatusUrl"] = spec["production_url"]
-      version = spec["production_version"] || (spec["production_url"] ? "V2" : nil)
-      if version && !valid_versions.include?(version)
-        UI.user_error!("production_version must be one of #{valid_versions} (got #{version.inspect})")
-      end
-      desired["subscriptionStatusUrlVersion"] = version
-    end
-
-    if spec.key?("sandbox_url")
-      desired["subscriptionStatusUrlForSandbox"] = spec["sandbox_url"]
-      version = spec["sandbox_version"] || (spec["sandbox_url"] ? "V2" : nil)
-      if version && !valid_versions.include?(version)
-        UI.user_error!("sandbox_version must be one of #{valid_versions} (got #{version.inspect})")
-      end
-      desired["subscriptionStatusUrlVersionForSandbox"] = version
-    end
-
-    if desired.empty?
-      UI.message(":: No production_url / sandbox_url keys present; nothing to do")
-      next
-    end
-
-    app_store_connect_api_key(
-      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
-      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
-      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
-    )
-
-    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
-    client = Spaceship::ConnectAPI.client.tunes_request_client
-
-    # Read current state to keep the lane idempotent.
-    current_resp = client.get("v1/apps/#{app.id}", {
-      "fields[apps]" => "subscriptionStatusUrl,subscriptionStatusUrlForSandbox,subscriptionStatusUrlVersion,subscriptionStatusUrlVersionForSandbox",
-    })
-    current = current_resp.body.dig("data", "attributes") || {}
-
-    diff = desired.reject { |k, v| current[k] == v }
-    if diff.empty?
-      UI.success(":: All subscription-status URL fields already at desired state; no PATCH sent")
-      next
-    end
-
-    client.patch("v1/apps/#{app.id}", {
-      data: { type: "apps", id: app.id, attributes: diff },
-    })
-
-    diff.each { |k, v| UI.success(":: #{k}: #{current[k].inspect} → #{v.inspect}") }
   end
 
   # ── IAP helpers (private to update_iap / fetch_iap) ──────────
