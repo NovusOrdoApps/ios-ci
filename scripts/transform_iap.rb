@@ -13,7 +13,9 @@
 #
 # Source layout (per product):
 #   <product_id>/
-#     product.jsonc              # type, reference_name, price_tier, family_shareable
+#     product.jsonc              # type, reference_name, customer_price (USD string),
+#                                 # territories (ISO 3166-1 alpha-3 array),
+#                                 # available_in_new_territories, family_shareable
 #     review_screenshot.png      # optional (required only for first review submission)
 #     Text/
 #       defaults/info.jsonc      # optional shared { name, description }
@@ -153,9 +155,25 @@ product_dirs.each do |product_id|
     errors << "#{product_id}: product_id exceeds #{FIELD_LIMITS['product_id']} chars"
   end
 
-  price_tier = meta["price_tier"]
-  unless price_tier.is_a?(Integer) && price_tier >= 0 && price_tier <= 87
-    errors << "#{product_id}: price_tier must be an integer 0-87 (got #{price_tier.inspect})"
+  # Apple deprecated legacy integer tiers when they moved to IAP V2.
+  # The new system uses USD price strings (e.g. "0.99", "1.99") which the
+  # lane translates to opaque price-point IDs by querying
+  # /v2/inAppPurchases/<id>/pricePoints?filter[territory]=USA.
+  customer_price = meta["customer_price"] || meta["price_tier"]   # back-compat
+  unless customer_price.is_a?(String) && customer_price.match?(/\A\d+(\.\d{1,2})?\z/)
+    errors << "#{product_id}: customer_price must be a USD-price string (e.g. \"0.99\"), got #{customer_price.inspect}"
+  end
+
+  territories = meta["territories"]
+  if territories.nil? || !territories.is_a?(Array) || territories.empty?
+    errors << "#{product_id}: territories must be a non-empty array of ISO 3166-1 alpha-3 codes (e.g. [\"USA\", \"GBR\"])"
+  elsif territories.any? { |t| !t.is_a?(String) || !t.match?(/\A[A-Z]{3}\z/) }
+    errors << "#{product_id}: every territory must be an ISO 3166-1 alpha-3 code; got #{territories.inspect}"
+  end
+
+  available_in_new_territories = meta.fetch("available_in_new_territories", true)
+  unless [true, false].include?(available_in_new_territories)
+    errors << "#{product_id}: available_in_new_territories must be true or false (got #{available_in_new_territories.inspect})"
   end
 
   family_shareable = meta.fetch("family_shareable", false)
@@ -210,13 +228,15 @@ product_dirs.each do |product_id|
   screenshot_path = nil unless File.file?(screenshot_path)
 
   products << {
-    "product_id"        => product_id,
-    "type"              => type,
-    "reference_name"    => reference_name,
-    "price_tier"        => price_tier,
-    "family_shareable"  => family_shareable,
-    "review_screenshot" => screenshot_path,
-    "localizations"     => localizations,
+    "product_id"                   => product_id,
+    "type"                         => type,
+    "reference_name"               => reference_name,
+    "customer_price"               => customer_price,
+    "territories"                  => territories,
+    "available_in_new_territories" => available_in_new_territories,
+    "family_shareable"             => family_shareable,
+    "review_screenshot"            => screenshot_path,
+    "localizations"                => localizations,
   }
 end
 
@@ -233,6 +253,6 @@ File.write(output_path, JSON.pretty_generate({ "products" => products }))
 puts(":: Validated #{products.length} product(s)")
 products.each do |p|
   shot = p["review_screenshot"] ? "screenshot=yes" : "screenshot=no"
-  puts(":: #{p['product_id']}  type=#{p['type']}  tier=#{p['price_tier']}  locales=#{p['localizations'].keys.join(',')}  #{shot}")
+  puts(":: #{p['product_id']}  type=#{p['type']}  price=$#{p['customer_price']}  territories=#{(p['territories'] || []).size}  locales=#{p['localizations'].keys.join(',')}  #{shot}")
 end
 puts(":: Wrote normalized IAP JSON to #{output_path}")
