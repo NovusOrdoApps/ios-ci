@@ -1,1 +1,6 @@
 docs/
+fastlane/README.md
+fastlane/report.xml
+Gemfile.lock
+.bundle/
+vendor/bundle/
