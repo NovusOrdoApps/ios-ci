@@ -1604,6 +1604,12 @@ platform :ios do
           source_offers: sub["introductory_offers"],
           warnings: warnings,
         )
+
+        sync_subscription_promotional_offers(
+          sub_id: sub_id, pid: pid,
+          source_offers: sub["promotional_offers"],
+          warnings: warnings,
+        )
       end
 
       # Group-level submission — submits every subscription in the
@@ -1721,6 +1727,7 @@ platform :ios do
           "territories"                  => territories_field,
           "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
           "introductory_offers"          => fetch_subscription_introductory_offers(sub_id: sub["id"]),
+          "promotional_offers"           => fetch_subscription_promotional_offers(sub_id: sub["id"]),
         }
         File.write(File.join(sub_dir, "subscription.json"), JSON.pretty_generate(meta))
 
@@ -2282,8 +2289,10 @@ platform :ios do
             price_point_id:    point_id,
           )
         rescue Spaceship::UnexpectedResponse => e
-          if e.message =~ /already exists|conflict/i
+          if e.message =~ /already exists|conflict|overlaps with existing offer/i
             # Same offer already configured for (sub, territory) — skip silently.
+            # Apple's wording for date-overlap conflict is the "overlaps"
+            # variant; a literal duplicate may also surface as "already exists".
           else
             warnings << "#{pid}: intro offer (#{mode}/#{duration}×#{periods}/#{territory}) failed: #{e.message}"
           end
@@ -2332,6 +2341,173 @@ platform :ios do
       bucket[:config].merge(
         "territories" => (sorted_terr.size == all_apple.size && sorted_terr == all_apple) ? "ALL" : sorted_terr
       )
+    end
+  end
+
+  # GET /v1/subscriptions/<id>/promotionalOffers
+  # Includes the per-territory price rows + price points so the dump
+  # can reconstruct customer_price + territory_prices in one request.
+  def list_subscription_promotional_offers(sub_id:)
+    # Apple's /v1/subscriptionPromotionalOfferPrices/<id> direct-fetch
+    # endpoint is not allowed ("no allowed operations defined"). Get the
+    # offer list here; resolve prices via /v1/subscriptionPromotionalOffers/<id>/prices
+    # which DOES support include=territory,subscriptionPricePoint.
+    resp = iap_client.get("v1/subscriptions/#{sub_id}/promotionalOffers", {
+      "limit" => 200,
+    }).body
+    resp["data"] || []
+  end
+
+  # Returns {territory_alpha3 => customer_price} for one offer. Single
+  # API call with include — Apple flattens territory + price point into
+  # the included array.
+  def fetch_promotional_offer_prices(offer_id:)
+    resp = iap_client.get("v1/subscriptionPromotionalOffers/#{offer_id}/prices", {
+      "include" => "territory,subscriptionPricePoint",
+      "limit"   => 200,
+    }).body
+
+    point_prices = (resp["included"] || [])
+      .select { |x| x["type"] == "subscriptionPricePoints" }
+      .each_with_object({}) { |x, h| h[x["id"]] = x.dig("attributes", "customerPrice") }
+
+    out = {}
+    (resp["data"] || []).each do |row|
+      terr  = row.dig("relationships", "territory", "data", "id")
+      pp_id = row.dig("relationships", "subscriptionPricePoint", "data", "id")
+      out[terr] = point_prices[pp_id] if terr && point_prices[pp_id]
+    end
+    out
+  rescue StandardError
+    {}
+  end
+
+  # POST /v1/subscriptionPromotionalOffers — single POST creates the
+  # offer + all its per-territory prices in one shot using the JSON:API
+  # `included` pattern (mirrors IAP price schedule create).
+  #
+  # `territory_to_point` is { territory_alpha3 => price_point_id } —
+  # one entry per territory the offer applies to.
+  def create_subscription_promotional_offer(sub_id:, name:, offer_code:, offer_mode:,
+                                            duration:, number_of_periods:,
+                                            territory_to_point:)
+    inline_ids = territory_to_point.keys.each_with_index.map { |_, i| "${promoprice-#{i}}" }
+    included   = territory_to_point.each_with_index.map do |(territory, point_id), i|
+      {
+        id:   "${promoprice-#{i}}",
+        type: "subscriptionPromotionalOfferPrices",
+        relationships: {
+          territory:              { data: { type: "territories",              id: territory } },
+          subscriptionPricePoint: { data: { type: "subscriptionPricePoints",  id: point_id } },
+        },
+      }
+    end
+
+    iap_client.post("v1/subscriptionPromotionalOffers", {
+      data: {
+        type: "subscriptionPromotionalOffers",
+        attributes: {
+          name:            name,
+          offerCode:       offer_code,
+          offerMode:       offer_mode,
+          duration:        duration,
+          numberOfPeriods: number_of_periods,
+        },
+        relationships: {
+          subscription: { data: { type: "subscriptions", id: sub_id } },
+          prices: { data: inline_ids.map { |id| { type: "subscriptionPromotionalOfferPrices", id: id } } },
+        },
+      },
+      included: included,
+    })
+  end
+
+  # Orchestrator. Each source offer expands to one POST. customer_price
+  # is the USD anchor; territory_prices override per-territory; the
+  # union of (USA + territory_prices keys) drives which territories
+  # the offer applies in. ADDITIVE — offers are looked up by offerCode
+  # and skipped if already present (Apple errors with 409 / "already
+  # used" / similar; we rescue both wordings).
+  def sync_subscription_promotional_offers(sub_id:, pid:, source_offers:, warnings:)
+    return if source_offers.nil? || source_offers.empty?
+
+    existing = list_subscription_promotional_offers(sub_id: sub_id)
+                 .map { |o| o.dig("attributes", "offerCode") }
+
+    source_offers.each_with_index do |offer, idx|
+      name       = offer.fetch("name")
+      code       = offer.fetch("offer_code")
+      mode       = offer.fetch("offer_mode")
+      duration   = offer.fetch("duration")
+      periods    = offer.fetch("number_of_periods")
+      base_price = offer["customer_price"]
+      overrides  = offer["territory_prices"] || {}
+
+      if existing.include?(code)
+        # Already present; skip (replacement-via-API is v2).
+        next
+      end
+
+      # Build territory→price map: USA gets base_price unless overridden,
+      # and each override territory gets its own price.
+      desired = {}
+      desired["USA"] = base_price if base_price
+      overrides.each { |t, p| desired[t] = p }
+
+      if desired.empty?
+        warnings << "#{pid}: promotional_offers[#{idx}] '#{code}' has no prices (need customer_price or territory_prices)"
+        next
+      end
+
+      begin
+        territory_to_point = {}
+        desired.each do |territory, price|
+          territory_to_point[territory] = fetch_subscription_price_point_id(
+            sub_id: sub_id, customer_price: price, territory: territory
+          )
+        end
+
+        create_subscription_promotional_offer(
+          sub_id:            sub_id,
+          name:              name,
+          offer_code:        code,
+          offer_mode:        mode,
+          duration:          duration,
+          number_of_periods: periods,
+          territory_to_point: territory_to_point,
+        )
+      rescue Spaceship::UnexpectedResponse => e
+        if e.message =~ /already exists|already used/i
+          # Another offer with same code raced us — fine.
+        else
+          warnings << "#{pid}: promotional_offer '#{code}' failed: #{e.message}"
+        end
+      rescue StandardError => e
+        warnings << "#{pid}: promotional_offer '#{code}' failed: #{e.message}"
+      end
+    end
+  end
+
+  # Round-trip dump. One source-shape entry per Apple offer, with
+  # USA price → customer_price and other territory prices →
+  # territory_prices (mirrors the base-price round-trip convention).
+  def fetch_subscription_promotional_offers(sub_id:)
+    list_subscription_promotional_offers(sub_id: sub_id).map do |row|
+      attrs         = row["attributes"] || {}
+      terr_to_price = fetch_promotional_offer_prices(offer_id: row["id"])
+
+      base_price       = terr_to_price["USA"]
+      territory_prices = terr_to_price.reject { |t, _| t == "USA" }
+
+      {
+        "name"              => attrs["name"],
+        "offer_code"        => attrs["offerCode"],
+        "offer_mode"        => attrs["offerMode"],
+        "duration"          => attrs["duration"],
+        "number_of_periods" => attrs["numberOfPeriods"],
+        "customer_price"    => base_price,
+        "territory_prices"  => territory_prices,
+      }
     end
   end
 
