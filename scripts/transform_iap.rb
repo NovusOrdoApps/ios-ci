@@ -164,9 +164,17 @@ product_dirs.each do |product_id|
     errors << "#{product_id}: customer_price must be a USD-price string (e.g. \"0.99\"), got #{customer_price.inspect}"
   end
 
+  # territories: either the literal string "ALL" (expanded at push
+  # time to Apple's canonical ~175-territory list) or a non-empty
+  # array of ISO 3166-1 alpha-3 codes. Sync compresses the all-set
+  # back to "ALL" for diff readability.
   territories = meta["territories"]
-  if territories.nil? || !territories.is_a?(Array) || territories.empty?
-    errors << "#{product_id}: territories must be a non-empty array of ISO 3166-1 alpha-3 codes (e.g. [\"USA\", \"GBR\"])"
+  if territories.is_a?(String)
+    if territories != "ALL"
+      errors << "#{product_id}: territories string must be \"ALL\" (or use a non-empty array of alpha-3 codes); got #{territories.inspect}"
+    end
+  elsif territories.nil? || !territories.is_a?(Array) || territories.empty?
+    errors << "#{product_id}: territories must be \"ALL\" or a non-empty array of ISO 3166-1 alpha-3 codes (e.g. [\"USA\", \"GBR\"])"
   elsif territories.any? { |t| !t.is_a?(String) || !t.match?(/\A[A-Z]{3}\z/) }
     errors << "#{product_id}: every territory must be an ISO 3166-1 alpha-3 code; got #{territories.inspect}"
   end
@@ -253,6 +261,8 @@ File.write(output_path, JSON.pretty_generate({ "products" => products }))
 puts(":: Validated #{products.length} product(s)")
 products.each do |p|
   shot = p["review_screenshot"] ? "screenshot=yes" : "screenshot=no"
-  puts(":: #{p['product_id']}  type=#{p['type']}  price=$#{p['customer_price']}  territories=#{(p['territories'] || []).size}  locales=#{p['localizations'].keys.join(',')}  #{shot}")
+  terr = p["territories"]
+  terr_summary = terr.is_a?(Array) ? terr.size.to_s : terr.to_s   # "ALL" or count
+  puts(":: #{p['product_id']}  type=#{p['type']}  price=$#{p['customer_price']}  territories=#{terr_summary}  locales=#{p['localizations'].keys.join(',')}  #{shot}")
 end
 puts(":: Wrote normalized IAP JSON to #{output_path}")
