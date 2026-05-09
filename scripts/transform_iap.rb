@@ -31,6 +31,7 @@ FIELD_LIMITS = {
   "description"    => 45,
   "reference_name" => 64,
   "product_id"     => 255,
+  "review_note"    => 4000,
 }.freeze
 
 VALID_TYPES = %w[consumable non_consumable non_renewing_subscription].freeze
@@ -200,6 +201,15 @@ product_dirs.each do |product_id|
     errors << "#{product_id}: family_shareable=true is only valid for non_consumable products (got type=#{type})"
   end
 
+  # Optional review_note — visible to App Review reviewer. Apple's
+  # web-UI counter caps at 4000 chars (verified live 2026-05-09).
+  review_note = meta["review_note"]
+  if review_note && !review_note.is_a?(String)
+    errors << "#{product_id}: review_note must be a string (got #{review_note.class})"
+  elsif review_note && review_note.length > FIELD_LIMITS["review_note"]
+    errors << "#{product_id}: review_note exceeds #{FIELD_LIMITS['review_note']} chars (got #{review_note.length})"
+  end
+
   text_dir = File.join(product_path, "Text")
   unless File.directory?(text_dir)
     errors << "#{product_id}: missing Text/ folder with at least one locale"
@@ -246,6 +256,7 @@ product_dirs.each do |product_id|
     "product_id"                   => product_id,
     "type"                         => type,
     "reference_name"               => reference_name,
+    "review_note"                  => review_note,
     "customer_price"               => customer_price,
     "territories"                  => territories,
     "available_in_new_territories" => available_in_new_territories,

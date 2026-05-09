@@ -617,6 +617,7 @@ platform :ios do
           name: product.fetch("reference_name"),
           in_app_purchase_type: apple_type,
           family_sharable: product.fetch("family_shareable", false),
+          review_note: product["review_note"],
         )
       else
         attrs = {}
@@ -626,6 +627,9 @@ platform :ios do
         current_fs = iap.dig("attributes", "familySharable")
         if !current_fs.nil? && current_fs != product["family_shareable"]
           attrs[:familySharable] = product["family_shareable"]
+        end
+        if product.key?("review_note") && iap.dig("attributes", "reviewNote") != product["review_note"]
+          attrs[:reviewNote] = product["review_note"]
         end
         unless attrs.empty?
           UI.message(":: Updating IAP '#{pid}' (#{attrs.keys.join(', ')})")
@@ -749,6 +753,7 @@ platform :ios do
       meta = {
         "type"                         => type,
         "reference_name"               => iap.dig("attributes", "name"),
+        "review_note"                  => iap.dig("attributes", "reviewNote"),
         "customer_price"               => fetch_iap_price_tier(iap_id: iap["id"]),
         "territories"                  => territories_field,
         "available_in_new_territories" => availability.fetch("available_in_new_territories", true),
@@ -1179,18 +1184,21 @@ platform :ios do
   end
 
   # POST /v2/inAppPurchases — create a new IAP. Returns the resource Hash.
-  def create_iap(app_id:, product_id:, name:, in_app_purchase_type:, family_sharable: false)
+  def create_iap(app_id:, product_id:, name:, in_app_purchase_type:, family_sharable: false, review_note: nil)
+    attrs = {
+      productId: product_id,
+      name: name,
+      inAppPurchaseType: in_app_purchase_type,
+      familySharable: family_sharable,
+    }
+    attrs[:reviewNote] = review_note if review_note && !review_note.empty?
+
     resp = iap_client.post(
       "v2/inAppPurchases",
       {
         data: {
           type: "inAppPurchases",
-          attributes: {
-            productId: product_id,
-            name: name,
-            inAppPurchaseType: in_app_purchase_type,
-            familySharable: family_sharable,
-          },
+          attributes: attrs,
           relationships: { app: { data: { type: "apps", id: app_id } } },
         },
       }
