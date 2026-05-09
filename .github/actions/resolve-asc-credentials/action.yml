@@ -89,7 +89,21 @@ runs:
         # alphabetically for determinism — the FIRST one wins when multiple
         # exist (typical dev/staging/prod naming sorts in that order if the
         # operator follows convention; otherwise pass team_slug explicitly).
-        envs_sorted=$(gh api "repos/$GITHUB_REPOSITORY/environments" --jq '.environments[].name' 2>/dev/null | sort || true)
+        #
+        # Two-step to handle gh-api failures cleanly: the default
+        # GITHUB_TOKEN doesn't always have permission to list Environments
+        # on the caller repo (returns 403 "Resource not accessible by
+        # integration"), and `gh api` writes the error JSON to STDOUT —
+        # if we piped that into --jq blindly, the error body would end up
+        # masquerading as a team_slug. Separate the API call from the
+        # parse so a failed call cleanly degrades to "0 envs detected"
+        # → Class 1 fallback.
+        if envs_raw=$(gh api "repos/$GITHUB_REPOSITORY/environments" 2>/dev/null); then
+          envs_sorted=$(echo "$envs_raw" | jq -r '.environments[].name // empty' 2>/dev/null | sort)
+        else
+          envs_sorted=""
+          echo ":: gh api environments listing failed (typically 403 on Class 1 repos with default GITHUB_TOKEN). Falling back to Class 1."
+        fi
         env_count=$(echo "$envs_sorted" | grep -c . || true)
 
         case "$env_count" in
