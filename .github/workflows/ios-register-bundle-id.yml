@@ -53,8 +53,6 @@ jobs:
     runs-on: ${{ inputs.macos_runner }}
     timeout-minutes: 10
 
-    env:
-
     steps:
       - name: Checkout ios-ci tooling
         uses: actions/checkout@v4

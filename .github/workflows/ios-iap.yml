@@ -42,8 +42,6 @@ jobs:
     runs-on: ${{ inputs.macos_runner }}
     timeout-minutes: 30
 
-    env:
-
     steps:
       - name: Checkout app/metadata repo
         uses: actions/checkout@v4

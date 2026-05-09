@@ -44,8 +44,6 @@ jobs:
       contents: write
       pull-requests: write
 
-    env:
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4

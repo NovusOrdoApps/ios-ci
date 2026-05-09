@@ -41,8 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    env:
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
