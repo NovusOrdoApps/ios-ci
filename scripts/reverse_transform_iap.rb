@@ -142,6 +142,11 @@ product_dirs.each do |product_id|
     puts(":: #{product_id}: defaults written (#{defaults.size} field(s) shared across all locales)")
   end
 
+  # Always create a folder per locale (even with empty info.jsonc when
+  # all values match defaults) so the source preserves which locales
+  # this product has on Apple. transform_iap.rb requires at least one
+  # non-`defaults` locale folder under Text/ — without this, sync→push
+  # round-trips break for IAPs whose locales all share identical content.
   written_locales = 0
   per_locale.each do |locale, info|
     overrides = {}
@@ -151,15 +156,13 @@ product_dirs.each do |product_id|
       overrides[key] = value unless defaults[key] == value
     end
 
-    next if overrides.empty?
-
     locale_dir = File.join(dest_text, locale)
     FileUtils.mkdir_p(locale_dir)
     write_jsonc(File.join(locale_dir, "info.jsonc"), overrides)
     written_locales += 1
   end
 
-  puts(":: #{product_id}: #{written_locales} locale-specific override(s) written")
+  puts(":: #{product_id}: #{written_locales} locale folder(s) written")
 end
 
 puts(":: Reverse transform complete — #{product_dirs.size} product(s) processed")

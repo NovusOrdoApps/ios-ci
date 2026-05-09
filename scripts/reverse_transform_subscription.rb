@@ -72,6 +72,12 @@ def write_localizations(text_dir, per_locale, fields)
     write_jsonc(File.join(defaults_dir, "info.jsonc"), defaults)
   end
 
+  # Always create a folder per locale (even with empty info.jsonc when
+  # all values match defaults) so the source preserves which locales
+  # exist on Apple. transform_subscription.rb requires at least one
+  # non-`defaults` locale folder under Text/ — without this, sync→push
+  # round-trips break for groups/subs whose locales all share identical
+  # content.
   written = 0
   per_locale.each do |locale, info|
     overrides = {}
@@ -80,14 +86,13 @@ def write_localizations(text_dir, per_locale, fields)
       next if value.nil?
       overrides[key] = value unless defaults[key] == value
     end
-    next if overrides.empty?
 
     locale_dir = File.join(text_dir, locale)
     FileUtils.mkdir_p(locale_dir)
     write_jsonc(File.join(locale_dir, "info.jsonc"), overrides)
     written += 1
   end
-  { defaults_count: defaults.size, locale_overrides: written }
+  { defaults_count: defaults.size, locale_folders: written }
 end
 
 args = parse_args(ARGV)
@@ -139,7 +144,7 @@ group_dirs.each do |group_folder|
 
     if per_locale.any?
       stats = write_localizations(File.join(dest_group, "Text"), per_locale, %w[name custom_app_name])
-      puts(":: group '#{group_folder}': #{stats[:defaults_count]} defaults, #{stats[:locale_overrides]} per-locale override(s)")
+      puts(":: group '#{group_folder}': #{stats[:defaults_count]} defaults, #{stats[:locale_folders]} locale folder(s)")
     end
   end
 
@@ -181,7 +186,7 @@ group_dirs.each do |group_folder|
     next if per_locale.empty?
 
     stats = write_localizations(File.join(dest_sub, "Text"), per_locale, %w[name description])
-    puts(":: #{group_folder}/#{product_id}: #{stats[:defaults_count]} defaults, #{stats[:locale_overrides]} per-locale override(s)")
+    puts(":: #{group_folder}/#{product_id}: #{stats[:defaults_count]} defaults, #{stats[:locale_folders]} locale folder(s)")
   end
 end
 
