@@ -7,7 +7,7 @@ description: >-
 
   Order of precedence:
     1. asc-app.jsonc → bundle_id field (if file present and field non-empty)
-    2. fallback input (caller passes ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }})
+    2. fallback input (caller passes vars.IOS_RELEASE_APP_BUNDLE_ID)
     3. Error if both empty
 
   Run AFTER 'actions/checkout@v4' on the caller repo.
