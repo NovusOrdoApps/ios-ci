@@ -81,7 +81,11 @@ locales = Dir.children(input_dir)
   .sort
 
 if locales.empty?
-  fail_with("No locale directories found in #{input_dir}")
+  # App has no editable version or no localizations on Apple — clean
+  # no-op, not a failure. Sync workflow's "Detect changes" step will
+  # see no diff and exit cleanly.
+  puts(":: No locale directories in #{input_dir} — app has no editable App Store version yet, or no localizations. Nothing to sync.")
+  exit(0)
 end
 
 puts(":: Found #{locales.size} locale(s): #{locales.join(', ')}")

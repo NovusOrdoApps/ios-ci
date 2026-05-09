@@ -104,7 +104,9 @@ group_dirs = Dir.children(input_dir)
   .sort
 
 if group_dirs.empty?
-  fail_with("No group directories in #{input_dir}")
+  # App has no subscription groups configured — clean no-op, not a failure.
+  puts(":: No subscription group directories in #{input_dir} — app has no subscriptions on Apple. Nothing to sync.")
+  exit(0)
 end
 
 puts(":: Found #{group_dirs.size} group(s): #{group_dirs.join(', ')}")

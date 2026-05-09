@@ -68,7 +68,11 @@ product_dirs = Dir.children(input_dir)
   .sort
 
 if product_dirs.empty?
-  fail_with("No product directories found in #{input_dir}")
+  # App has no IAPs configured on Apple's side — clean no-op, not a failure.
+  # The sync workflow will see an empty metadata/InAppPurchases/ folder
+  # and skip the PR-creation step (no diff to commit).
+  puts(":: No IAP product directories in #{input_dir} — app has no IAPs on Apple. Nothing to sync.")
+  exit(0)
 end
 
 puts(":: Found #{product_dirs.size} product(s): #{product_dirs.join(', ')}")
