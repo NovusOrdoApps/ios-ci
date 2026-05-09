@@ -74,6 +74,14 @@ jobs:
           fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
 
 
+      - name: '[debug] What does vars.IOS_RELEASE_APP_BUNDLE_ID resolve to here?'
+        env:
+          DEBUG_VARS_VALUE: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+          DEBUG_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          echo ":: github.repository    = $DEBUG_GITHUB_REPO"
+          echo ":: vars.IOS_RELEASE_APP_BUNDLE_ID (length=${#DEBUG_VARS_VALUE}) = '$DEBUG_VARS_VALUE'"
+
       - name: Resolve app bundle ID (asc-app.jsonc → fallback to repo var)
         uses: ./_ci/.github/actions/resolve-app-bundle-id
         with:
