@@ -203,7 +203,22 @@ platform :ios do
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
 
     version = app.get_edit_app_store_version
-    UI.user_error!("No editable App Store version found — cannot create localizations on a Ready-for-Sale version. Create a new version draft in App Store Connect first.") unless version
+
+    # If no draft exists and a target app_version was provided, create the draft
+    # ourselves. Mirrors what deliver's verify_version does later in the run,
+    # pulled forward so localization bootstrap can proceed in the same run.
+    if version.nil?
+      target_version = ENV["APP_VERSION"].to_s.strip
+      if target_version.empty?
+        UI.user_error!("No editable App Store version found and no app_version was supplied. Pass app_version to the workflow so a new draft can be created, or create the draft manually in App Store Connect.")
+      end
+
+      UI.message(":: No editable version found — creating draft for '#{target_version}'.")
+      app.ensure_version!(target_version, platform: Spaceship::ConnectAPI::Platform::IOS)
+      version = app.get_edit_app_store_version
+      UI.user_error!("Created version '#{target_version}' but could not re-fetch the editable version.") unless version
+      UI.success(":: Created editable version '#{version.version_string}'.")
+    end
 
     app_info = app.fetch_edit_app_info
     UI.user_error!("No editable App Info found — cannot bootstrap app-info localizations.") unless app_info

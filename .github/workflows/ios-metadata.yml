@@ -113,6 +113,7 @@ jobs:
         working-directory: _ci
         env:
           METADATA_ROOT: ${{ github.workspace }}/metadata
+          APP_VERSION: ${{ inputs.app_version }}
         run: bundle exec fastlane ensure_locales
 
       - name: Fetch active locales from App Store Connect
