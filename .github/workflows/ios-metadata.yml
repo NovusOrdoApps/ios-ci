@@ -109,6 +109,12 @@ jobs:
           echo ":: Update WhatsNew Only: ${{ inputs.update_whatsnew_only }}"
           echo ":: Update Promotional Text Only: ${{ inputs.update_promotional_text_only }}"
 
+      - name: Ensure repo locales exist on App Store Connect
+        working-directory: _ci
+        env:
+          METADATA_ROOT: ${{ github.workspace }}/metadata
+        run: bundle exec fastlane ensure_locales
+
       - name: Fetch active locales from App Store Connect
         id: locales
         working-directory: _ci

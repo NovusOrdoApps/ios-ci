@@ -150,6 +150,112 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # ensure_locales
+  #
+  # Bootstraps App Store Connect localizations for every locale present
+  # in the repo's metadata/Text/ and metadata/Screenshots/ folders. Idempotent:
+  # locales already on ASC are left alone; missing ones are created empty so
+  # the downstream fetch_locales/update_metadata steps see and fill them.
+  #
+  # Without this step, the repo is *not* the source of truth — a new locale
+  # folder in the repo is silently ignored until someone manually adds the
+  # localization to the editable version on App Store Connect.
+  #
+  # Required env: METADATA_ROOT (absolute path to the repo's metadata/ dir)
+  # Usage: bundle exec fastlane ensure_locales
+  # ──────────────────────────────────────────────
+  lane :ensure_locales do
+    require "spaceship"
+
+    metadata_root = ENV.fetch("METADATA_ROOT")
+    UI.user_error!("METADATA_ROOT does not exist: #{metadata_root}") unless File.directory?(metadata_root)
+
+    text_dir = File.join(metadata_root, "Text")
+    screenshots_dir = File.join(metadata_root, "Screenshots")
+
+    repo_locales = []
+    if File.directory?(text_dir)
+      repo_locales += Dir.children(text_dir).select do |entry|
+        entry != "defaults" && File.directory?(File.join(text_dir, entry))
+      end
+    end
+    if File.directory?(screenshots_dir)
+      repo_locales += Dir.children(screenshots_dir).select do |entry|
+        File.directory?(File.join(screenshots_dir, entry))
+      end
+    end
+    repo_locales = repo_locales.uniq.sort
+
+    if repo_locales.empty?
+      UI.message(":: No locale folders found under #{metadata_root} — nothing to bootstrap.")
+      next
+    end
+
+    UI.message(":: Repo locales (#{repo_locales.size}): #{repo_locales.join(', ')}")
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    version = app.get_edit_app_store_version
+    UI.user_error!("No editable App Store version found — cannot create localizations on a Ready-for-Sale version. Create a new version draft in App Store Connect first.") unless version
+
+    app_info = app.fetch_edit_app_info
+    UI.user_error!("No editable App Info found — cannot bootstrap app-info localizations.") unless app_info
+
+    existing_version_locales = version.get_app_store_version_localizations.map(&:locale)
+    existing_app_info_locales = app_info.get_app_info_localizations.map(&:locale)
+
+    version_missing = repo_locales - existing_version_locales
+    app_info_missing = repo_locales - existing_app_info_locales
+
+    if version_missing.empty? && app_info_missing.empty?
+      UI.success(":: All #{repo_locales.size} repo locale(s) already present on App Store Connect.")
+      next
+    end
+
+    UI.message(":: Existing version localizations (#{existing_version_locales.size}): #{existing_version_locales.sort.join(', ')}")
+    UI.message(":: Existing app-info localizations (#{existing_app_info_locales.size}): #{existing_app_info_locales.sort.join(', ')}")
+    UI.message(":: Will create #{version_missing.size} version localization(s): #{version_missing.join(', ')}") unless version_missing.empty?
+    UI.message(":: Will create #{app_info_missing.size} app-info localization(s): #{app_info_missing.join(', ')}") unless app_info_missing.empty?
+
+    failures = []
+
+    version_missing.each do |locale|
+      begin
+        version.create_app_store_version_localization(attributes: { locale: locale })
+        UI.message(":: Created version localization for '#{locale}'")
+      rescue StandardError => e
+        failures << { scope: "version", locale: locale, message: e.message }
+        UI.important(":: Failed to create version localization for '#{locale}': #{e.message}")
+      end
+    end
+
+    app_info_missing.each do |locale|
+      begin
+        app_info.create_app_info_localization(attributes: { locale: locale })
+        UI.message(":: Created app-info localization for '#{locale}'")
+      rescue StandardError => e
+        failures << { scope: "app_info", locale: locale, message: e.message }
+        UI.important(":: Failed to create app-info localization for '#{locale}': #{e.message}")
+      end
+    end
+
+    if failures.empty?
+      UI.success(":: Bootstrap complete.")
+    else
+      # Don't abort the workflow — a bad locale code shouldn't block the rest.
+      # The downstream fetch_locales will simply not include the failed ones.
+      UI.important(":: Completed with #{failures.size} failure(s). Failed locale(s) will be skipped by the rest of the pipeline.")
+    end
+  end
+
+  # ──────────────────────────────────────────────
   # fetch_locales
   #
   # Queries App Store Connect for the app's active locales.
