@@ -1,0 +1,85 @@
+# Reusable workflow: Snapshot the app's current App Store Connect status.
+#
+# Read-only. Writes a color-coded markdown report to the GitHub Step Summary
+# (top of the run page) plus matching GitHub Actions annotations. Never
+# mutates ASC state — safe to run from any branch as often as you like.
+#
+# Required repo secrets:
+#   APP_STORE_CONNECT_API_KEY_P8
+#   APP_STORE_CONNECT_KEY_ID
+#   APP_STORE_CONNECT_ISSUER_ID
+#
+# Required repo variables:
+#   IOS_RELEASE_APP_BUNDLE_ID
+
+name: iOS App Status (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      team_slug:
+        description: "Optional team slug for vault-resolved ASC credentials"
+        required: false
+        type: string
+        default: ""
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+      runner:
+        description: "Runner label. Linux is fine — no Xcode needed."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+
+concurrency:
+  group: ios-app-status-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  status:
+    name: App Store Connect status
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
+        uses: ./_ci/.github/actions/resolve-asc-credentials
+        with:
+          team_slug:          ${{ inputs.team_slug }}
+          vault_pat:          ${{ secrets.VAULT_REPO_PAT }}
+          fallback_p8:        ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          fallback_key_id:    ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+
+      - name: Resolve app bundle ID (asc-app.jsonc → fallback to repo var)
+        uses: ./_ci/.github/actions/resolve-app-bundle-id
+        with:
+          fallback: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+      - name: Fetch App Store Connect status
+        working-directory: _ci
+        run: bundle exec fastlane fetch_app_status
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/asc-secrets/AuthKey.p8"

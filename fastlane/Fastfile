@@ -308,6 +308,210 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # fetch_app_status
+  #
+  # Queries App Store Connect for the app's current distribution state
+  # (live version, editable draft, latest TestFlight build) and writes a
+  # color-coded markdown report to GITHUB_STEP_SUMMARY plus matching
+  # GitHub Actions annotations.
+  #
+  # Read-only — never mutates ASC state. Safe to run from any branch.
+  #
+  # Usage: bundle exec fastlane fetch_app_status
+  # ──────────────────────────────────────────────
+  lane :fetch_app_status do
+    require "spaceship"
+
+    # ── status classification ───────────────────────────────────────
+    # 🟢 ready / healthy
+    # ⚪ in-progress draft (user-controlled, not blocking)
+    # 🟡 waiting on Apple
+    # 🔴 problem requiring action
+    green_states  = %w[READY_FOR_SALE PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE ACCEPTED READY_FOR_DISTRIBUTION].freeze
+    neutral_states = %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW REPLACED_WITH_NEW_VERSION DEVELOPER_REMOVED_FROM_SALE REMOVED_FROM_SALE].freeze
+    yellow_states = %w[WAITING_FOR_REVIEW IN_REVIEW WAITING_FOR_EXPORT_COMPLIANCE PROCESSING_FOR_APP_STORE PENDING_CONTRACT NOT_APPLICABLE].freeze
+    red_states    = %w[REJECTED METADATA_REJECTED INVALID_BINARY DEVELOPER_REJECTED].freeze
+
+    classify = lambda do |state|
+      s = state.to_s
+      return :green   if green_states.include?(s)
+      return :red     if red_states.include?(s)
+      return :yellow  if yellow_states.include?(s)
+      return :neutral if neutral_states.include?(s)
+      :unknown
+    end
+
+    icon_for = { green: "🟢", yellow: "🟡", red: "🔴", neutral: "⚪", unknown: "⚫" }
+    label_for_state = lambda do |state|
+      state.to_s.split("_").map(&:capitalize).join(" ")
+    end
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    bundle_id = ENV.fetch("APP_BUNDLE_ID")
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    UI.user_error!("App not found: #{bundle_id}") unless app
+
+    sections = []     # [{title:, severity:, lines: []}]
+    annotations = []  # [{level:, message:}]
+
+    # ── Live version ─────────────────────────────────────────────────
+    live = app.get_live_app_store_version
+    if live
+      sev = classify.call(live.app_store_state)
+      release_date = live.earliest_release_date || live.created_date
+      lines = ["**#{live.version_string}** — #{label_for_state.call(live.app_store_state)}"]
+      lines << "_Released: #{release_date}_" if release_date
+      sections << { title: "Live", severity: sev, lines: lines, state: live.app_store_state }
+    else
+      sections << { title: "Live", severity: :neutral, lines: ["_No live version on App Store Connect yet._"], state: nil }
+    end
+
+    # ── Editable draft ───────────────────────────────────────────────
+    draft = app.get_edit_app_store_version
+    if draft
+      sev = classify.call(draft.app_store_state)
+      lines = ["**#{draft.version_string}** — #{label_for_state.call(draft.app_store_state)}"]
+      lines << "_Last modified: #{draft.created_date}_" if draft.created_date
+      if draft.release_type
+        rt = draft.release_type.to_s
+        if rt == "SCHEDULED" && draft.earliest_release_date
+          lines << "_Release: scheduled for #{draft.earliest_release_date}_"
+        elsif rt == "MANUAL"
+          lines << "_Release: manual (you control timing)_"
+        elsif rt == "AFTER_APPROVAL"
+          lines << "_Release: automatic on approval_"
+        end
+      end
+      sections << { title: "Draft", severity: sev, lines: lines, state: draft.app_store_state }
+
+      case sev
+      when :yellow
+        annotations << { level: "warning", message: "Draft #{draft.version_string} is #{label_for_state.call(draft.app_store_state)} on App Store Connect." }
+      when :red
+        annotations << { level: "error", message: "Draft #{draft.version_string} is #{label_for_state.call(draft.app_store_state)} — check App Store Connect for reviewer feedback." }
+      end
+    else
+      sections << { title: "Draft", severity: :neutral, lines: ["_No editable draft. Create one from App Store Connect or pass `app_version` to the metadata workflow._"], state: nil }
+    end
+
+    # ── Latest TestFlight build ──────────────────────────────────────
+    builds = app.get_builds(
+      sort: "-uploadedDate",
+      limit: 1,
+      includes: "preReleaseVersion,betaAppReviewSubmission",
+    )
+    build = builds.first
+    if build
+      marketing = build.pre_release_version&.version
+      lines = ["**#{marketing || '?'} (#{build.version})**"]
+      lines << "_Uploaded: #{build.uploaded_date}_" if build.uploaded_date
+
+      proc_state = build.processing_state.to_s
+      proc_sev =
+        case proc_state
+        when "VALID" then :green
+        when "PROCESSING" then :yellow
+        when "FAILED", "INVALID" then :red
+        else :neutral
+        end
+      lines << "_Processing: #{label_for_state.call(proc_state)}_" unless proc_state.empty?
+
+      beta = build.beta_app_review_submission
+      beta_sev = :neutral
+      if beta && beta.beta_review_state
+        bs = beta.beta_review_state.to_s
+        beta_sev =
+          case bs
+          when "APPROVED" then :green
+          when "WAITING_FOR_REVIEW", "IN_REVIEW" then :yellow
+          when "REJECTED" then :red
+          else :neutral
+          end
+        lines << "_Beta review: #{label_for_state.call(bs)}_"
+      end
+
+      if build.expired
+        lines << "_Status: **EXPIRED**_"
+        sev = :red
+      elsif build.expiration_date
+        # uploaded_date and expiration_date are ISO8601 strings
+        begin
+          days_left = ((Time.parse(build.expiration_date) - Time.now) / 86_400).to_i
+          lines << "_Expires: #{build.expiration_date} (#{days_left}d)_"
+          sev = days_left < 14 ? :yellow : [proc_sev, beta_sev].max_by { |s| { green: 0, neutral: 1, yellow: 2, red: 3 }[s] }
+        rescue ArgumentError
+          sev = [proc_sev, beta_sev].max_by { |s| { green: 0, neutral: 1, yellow: 2, red: 3 }[s] }
+        end
+      else
+        sev = [proc_sev, beta_sev].max_by { |s| { green: 0, neutral: 1, yellow: 2, red: 3 }[s] }
+      end
+
+      sections << { title: "TestFlight", severity: sev, lines: lines, state: proc_state }
+
+      if proc_sev == :red
+        annotations << { level: "error", message: "TestFlight build #{marketing} (#{build.version}) processing failed." }
+      elsif beta_sev == :red
+        annotations << { level: "error", message: "TestFlight build #{marketing} (#{build.version}) was rejected in beta review." }
+      end
+    else
+      sections << { title: "TestFlight", severity: :neutral, lines: ["_No TestFlight builds._"], state: nil }
+    end
+
+    # ── Overall severity (worst section wins) ────────────────────────
+    severity_rank = { green: 0, neutral: 1, yellow: 2, red: 3 }
+    overall = sections.map { |s| s[:severity] }.max_by { |s| severity_rank[s] || 0 } || :neutral
+    overall_icon = icon_for[overall]
+
+    headline =
+      case overall
+      when :red    then "Needs Attention"
+      when :yellow then "In Progress"
+      when :green  then "Healthy"
+      else "Status"
+      end
+
+    # ── Markdown report → GitHub Step Summary ────────────────────────
+    md = []
+    md << "# #{overall_icon} #{app.name || bundle_id} — #{headline}"
+    md << ""
+    md << "**Bundle ID:** `#{bundle_id}`"
+    md << ""
+    sections.each do |s|
+      md << "## #{icon_for[s[:severity]]} #{s[:title]}"
+      s[:lines].each { |line| md << line }
+      md << ""
+    end
+    md << "---"
+    md << "_Snapshot taken: #{Time.now.utc.iso8601}_"
+
+    summary_path = ENV["GITHUB_STEP_SUMMARY"]
+    if summary_path && !summary_path.empty?
+      File.open(summary_path, "a") { |f| f.puts(md.join("\n")) }
+      UI.message(":: Wrote status report to GITHUB_STEP_SUMMARY")
+    end
+
+    # ── Console output (always) ──────────────────────────────────────
+    UI.message("")
+    md.each { |line| UI.message(line.gsub(/[*_`]/, "")) }
+    UI.message("")
+
+    # ── GitHub Actions annotations ───────────────────────────────────
+    if ENV["GITHUB_ACTIONS"] == "true"
+      annotations.each do |a|
+        puts "::#{a[:level]}::#{a[:message]}"
+      end
+    end
+
+    # Exit successfully even on red — the report is the deliverable, not a gate.
+    # CI surfaces severity via annotations + step summary.
+  end
+
+  # ──────────────────────────────────────────────
   # fetch_screenshots
   #
   # Downloads screenshots from App Store Connect (latest live or editable version)
