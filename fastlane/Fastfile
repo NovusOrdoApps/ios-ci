@@ -1141,10 +1141,10 @@ platform :ios do
     UI.user_error!("Missing identifier (or APP_BUNDLE_ID env)") if identifier.to_s.empty?
 
     name = options[:name] || identifier
-    platform = options[:platform] || "IOS"   # IOS | MAC_OS (Apple's REST accepts only these)
+    platform = options[:platform] || "UNIVERSAL"   # IOS | MAC_OS | UNIVERSAL
 
-    UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS") \
-      unless %w[IOS MAC_OS].include?(platform)
+    UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS | UNIVERSAL") \
+      unless %w[IOS MAC_OS UNIVERSAL].include?(platform)
 
     app_store_connect_api_key(
       key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
