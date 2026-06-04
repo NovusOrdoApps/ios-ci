@@ -242,9 +242,15 @@ jobs:
       - name: Apply CI-managed release identity
         if: inputs.release_identity_mode == 'managed'
         working-directory: _ci
+        env:
+          # resolve-app-bundle-id already set APP_BUNDLE_ID from asc-app.jsonc
+          # (Class 2 / vault) or the IOS_RELEASE_APP_BUNDLE_ID var (Class 1).
+          # manage-release-identity.rb reads IOS_RELEASE_APP_BUNDLE_ID, so feed
+          # it the resolved value — otherwise vault-based repos (empty var) fail.
+          IOS_RELEASE_APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
         run: |
-          : "${IOS_RELEASE_TEAM_ID:?Missing GitHub Actions variable IOS_RELEASE_TEAM_ID}"
-          : "${IOS_RELEASE_APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
+          : "${IOS_RELEASE_TEAM_ID:?Missing IOS_RELEASE_TEAM_ID — set the var or ensure vault team_id.txt exists}"
+          : "${IOS_RELEASE_APP_BUNDLE_ID:?Missing bundle id — set asc-app.jsonc bundle_id or the IOS_RELEASE_APP_BUNDLE_ID var}"
           bundle exec ruby scripts/manage-release-identity.rb \
             "$GITHUB_WORKSPACE" \
             "${{ steps.detect_pre.outputs.project }}" \
