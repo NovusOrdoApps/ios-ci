@@ -1382,6 +1382,166 @@ platform :ios do
     UI.success("Done")
   end
 
+  # ──────────────────────────────────────────────
+  # update_age_rating
+  #
+  # Sets the App's Age Rating questionnaire from
+  # metadata/AppInfo/age_rating.jsonc. Direct REST PATCH (JWT auth),
+  # bypassing deliver — the JSONC uses Apple's API-level shape (snake_case
+  # keys → camelCase attrs; NONE/INFREQUENT_OR_MILD/FREQUENT_OR_INTENSE
+  # strings + booleans). Apple auto-computes the 4+/9+/12+/17+ rating
+  # (+ regional ratings) on save. Idempotent: diffs against current.
+  #
+  #   GET   /v1/apps/<id>/appInfos?include=ageRatingDeclaration  → decl id
+  #   PATCH /v1/ageRatingDeclarations/<decl_id>
+  #
+  # Usage: bundle exec fastlane update_age_rating input_path:/path/to/age_rating.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_age_rating do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Age rating file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+    if spec.empty?
+      UI.message(":: age_rating.jsonc is empty; nothing to do")
+      next
+    end
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    client = Spaceship::ConnectAPI.client.tunes_request_client
+
+    # The ageRatingDeclaration is a singleton, 1:1 with the app's appInfo.
+    resp = client.get("v1/apps/#{app.id}/appInfos", { "include" => "ageRatingDeclaration" }).body
+    decl = (resp["included"] || []).find { |x| x["type"] == "ageRatingDeclarations" }
+    decl_id = decl && decl["id"]
+    if decl_id.to_s.empty?
+      first_info = (resp["data"] || []).first
+      decl_id = first_info && first_info.dig("relationships", "ageRatingDeclaration", "data", "id")
+    end
+    UI.user_error!("Could not resolve ageRatingDeclaration id for #{ENV['APP_BUNDLE_ID']} (is the app created?)") if decl_id.to_s.empty?
+
+    # snake_case JSONC keys → Apple camelCase attributes ("v2" → "V2" via capitalize)
+    desired = {}
+    spec.each do |k, v|
+      camel = k.to_s.split("_").each_with_index.map { |p, i| i.zero? ? p : p.capitalize }.join
+      desired[camel] = v
+    end
+
+    current = (decl && decl["attributes"]) || {}
+    current = (client.get("v1/ageRatingDeclarations/#{decl_id}").body.dig("data", "attributes") || {}) if current.empty?
+    diff = desired.reject { |k, v| current.key?(k) && current[k] == v }
+
+    if diff.empty?
+      UI.message(":: Age rating already at desired state; no PATCH sent")
+      next
+    end
+    client.patch("v1/ageRatingDeclarations/#{decl_id}", {
+      data: { type: "ageRatingDeclarations", id: decl_id, attributes: diff },
+    })
+    diff.each { |k, v| UI.success(":: ageRating #{k}: #{current[k].inspect} → #{v.inspect}") }
+    UI.success("Age rating saved (#{diff.size} field(s)). Apple auto-computes the final rating.")
+  end
+
+  # ──────────────────────────────────────────────
+  # update_categories
+  #
+  # Sets the App Store primary/secondary category (+ optional game
+  # subcategories) from metadata/AppInfo/categories.jsonc. Direct REST PATCH
+  # (JWT auth) of the editable appInfo's category relationships. Idempotent:
+  # diffs against the current relationship ids.
+  #
+  # categories.jsonc keys (all optional; only provided keys are touched):
+  #   primary_category, secondary_category,
+  #   primary_subcategory_one, primary_subcategory_two,
+  #   secondary_subcategory_one, secondary_subcategory_two
+  # Values are App Store Connect appCategories ids, e.g. "UTILITIES".
+  # Set a value to null to CLEAR that relationship.
+  #
+  #   GET   /v1/apps/<id>/appInfos?include=primaryCategory,secondaryCategory,...
+  #   PATCH /v1/appInfos/<editable_appInfo_id>  (relationships)
+  #
+  # Usage: bundle exec fastlane update_categories input_path:/path/to/categories.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_categories do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Categories file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+    if spec.empty?
+      UI.message(":: categories.jsonc is empty; nothing to do")
+      next
+    end
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    client = Spaceship::ConnectAPI.client.tunes_request_client
+
+    rel_map = {
+      "primary_category"          => "primaryCategory",
+      "secondary_category"        => "secondaryCategory",
+      "primary_subcategory_one"   => "primarySubcategoryOne",
+      "primary_subcategory_two"   => "primarySubcategoryTwo",
+      "secondary_subcategory_one" => "secondarySubcategoryOne",
+      "secondary_subcategory_two" => "secondarySubcategoryTwo",
+    }
+
+    resp = client.get("v1/apps/#{app.id}/appInfos", { "include" => rel_map.values.join(",") }).body
+    app_infos = resp["data"] || []
+    UI.user_error!("No appInfo for #{ENV['APP_BUNDLE_ID']} — create the app first (asc-init Step 2)") if app_infos.empty?
+
+    # Prefer an editable appInfo (skip locked/live states).
+    locked = %w[READY_FOR_DISTRIBUTION REPLACED_WITH_NEW_INFO REJECTED ACCEPTED].freeze
+    app_info = app_infos.find { |ai|
+      st = ai.dig("attributes", "appStoreState") || ai.dig("attributes", "state")
+      !locked.include?(st)
+    } || app_infos.first
+    app_info_id = app_info["id"]
+
+    desired_rels = {}
+    log = []
+    rel_map.each do |snake, camel|
+      next unless spec.key?(snake)
+      catid  = spec[snake]
+      cur_id = app_info.dig("relationships", camel, "data", "id")
+      if catid.nil? || catid.to_s.empty?
+        next if cur_id.nil?
+        desired_rels[camel] = { "data" => nil }
+        log << "#{camel}: #{cur_id} → (cleared)"
+      else
+        next if cur_id == catid
+        desired_rels[camel] = { "data" => { "type" => "appCategories", "id" => catid } }
+        log << "#{camel}: #{cur_id.inspect} → #{catid}"
+      end
+    end
+
+    if desired_rels.empty?
+      UI.message(":: Categories already at desired state; no PATCH sent")
+      next
+    end
+    client.patch("v1/appInfos/#{app_info_id}", {
+      data: { type: "appInfos", id: app_info_id, relationships: desired_rels },
+    })
+    log.each { |l| UI.success(":: #{l}") }
+    UI.success("Categories saved (#{desired_rels.size} relationship(s)).")
+  end
+
   lane :fetch_app_info do |options|
     require "spaceship"
     require "fileutils"
