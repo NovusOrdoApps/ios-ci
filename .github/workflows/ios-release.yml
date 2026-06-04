@@ -289,6 +289,9 @@ jobs:
         if: inputs.release_identity_mode == 'managed'
         env:
           DETECTED_TARGETS_JSON: ${{ steps.detect.outputs.targets_json }}
+          # Use the resolved bundle id (asc-app.jsonc / vault), not the raw var
+          # which is empty for Class-2 (vault) repos.
+          IOS_RELEASE_APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
         run: |
           if [ "${{ steps.detect.outputs.team_id }}" != "$IOS_RELEASE_TEAM_ID" ]; then
             echo "ERROR: ios-ci patched DEVELOPMENT_TEAM to '$IOS_RELEASE_TEAM_ID', but xcodebuild resolved '${{ steps.detect.outputs.team_id }}'." >&2
