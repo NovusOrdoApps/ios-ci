@@ -70,6 +70,7 @@ jobs:
       - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
         uses: ./_ci/.github/actions/resolve-asc-credentials
         with:
+          gh_token:           ${{ secrets.CHECKOUT_PAT || github.token }}
           team_slug:          ${{ inputs.team_slug }}
           vault_pat:          ${{ secrets.VAULT_REPO_PAT }}
           fallback_p8:        ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
