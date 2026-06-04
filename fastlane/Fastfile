@@ -863,6 +863,25 @@ platform :ios do
       deliver_opts[:overwrite_screenshots] = true
     end
 
+    # ── New-app deliver guard ────────────────────────────────────────────
+    # fastlane deliver's review_attachment_file calls
+    # version.fetch_app_store_review_detail, whose GET parse raises "No data"
+    # on a brand-new app version that has no appStoreReviewDetail yet (e.g.
+    # an app freshly created by asc-init). Established apps already have one,
+    # so they're unaffected. Pre-create an empty review detail so deliver's
+    # review step has something to read. Idempotent + best-effort.
+    begin
+      require "spaceship"
+      guard_app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+      guard_ver = guard_app && guard_app.get_edit_app_store_version
+      if guard_ver && (guard_ver.fetch_app_store_review_detail rescue nil).nil?
+        guard_ver.create_app_store_review_detail(attributes: { demo_account_required: false })
+        UI.success(":: Pre-created empty App Review Detail (new-app deliver guard)")
+      end
+    rescue => e
+      UI.important(":: App Review Detail pre-create skipped (#{e.message}) — deliver may still handle it")
+    end
+
     deliver(deliver_opts)
   end
 
