@@ -1561,6 +1561,90 @@ platform :ios do
     UI.success("Categories saved (#{desired_rels.size} relationship(s)).")
   end
 
+  # ──────────────────────────────────────────────
+  # update_app_pricing
+  #
+  # Sets the app's base price from metadata/AppInfo/pricing.jsonc via the
+  # MODERN price API: POST /v1/appPriceSchedules with the appPricePoint that
+  # matches the desired customerPrice in the base territory. Apple derives
+  # equivalent prices for every other territory from that anchor. Mirrors the
+  # live-verified IAP price-schedule flow (sync_iap_price). Idempotent: skips
+  # when the current base-territory price already matches.
+  #
+  # pricing.jsonc:  { "customer_price": "0", "base_territory": "USA" }
+  #   customer_price "0" / "0.00" = Free.
+  #
+  # Usage: bundle exec fastlane update_app_pricing input_path:/path/to/pricing.jsonc
+  # ──────────────────────────────────────────────
+  lane :update_app_pricing do |options|
+    require "spaceship"
+
+    input_path = options[:input_path]
+    UI.user_error!("Missing input_path") if input_path.to_s.empty?
+    UI.user_error!("Pricing file not found: #{input_path}") unless File.exist?(input_path)
+
+    spec = parse_jsonc(File.read(input_path))
+    if spec.empty?
+      UI.message(":: pricing.jsonc is empty; nothing to do")
+      next
+    end
+
+    base = (spec["base_territory"] || "USA").to_s
+    cp   = (spec["customer_price"] || spec["price"]).to_s
+    UI.user_error!('pricing.jsonc must set customer_price ("0" = Free)') if cp.empty?
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+    app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
+    client = Spaceship::ConnectAPI.client.tunes_request_client
+
+    # Idempotency: current base-territory price (appPriceSchedule id == app id).
+    current = begin
+      r   = client.get("v1/appPriceSchedules/#{app.id}/manualPrices",
+                       { "include" => "appPricePoint", "limit" => 10 }).body
+      ref = (r["data"] || []).first&.dig("relationships", "appPricePoint", "data", "id")
+      pt  = ref && (r["included"] || []).find { |x| x["type"] == "appPricePoints" && x["id"] == ref }
+      pt && pt.dig("attributes", "customerPrice")
+    rescue StandardError
+      nil
+    end
+    if current && current.to_f == cp.to_f
+      UI.message(":: App price already #{current} in #{base}; no change")
+      next
+    end
+
+    # Find the appPricePoint whose customerPrice matches (float-compare so
+    # "0" == "0.00"). Apple lists ~900 points/territory; limit mirrors the
+    # verified IAP lookup.
+    page  = client.get("v1/apps/#{app.id}/appPricePoints",
+                       { "filter[territory]" => base, "limit" => 1000 }).body
+    point = (page["data"] || []).find { |p| p.dig("attributes", "customerPrice").to_f == cp.to_f }
+    UI.user_error!("No app price point for customer_price=#{cp.inspect} in #{base} (\"0\" = Free).") unless point
+
+    client.post("v1/appPriceSchedules", {
+      data: {
+        type: "appPriceSchedules",
+        relationships: {
+          app:           { data: { type: "apps", id: app.id } },
+          baseTerritory: { data: { type: "territories", id: base } },
+          manualPrices:  { data: [{ type: "appPrices", id: "${newprice}" }] },
+        }
+      },
+      included: [{
+        id: "${newprice}",
+        type: "appPrices",
+        attributes: { startDate: nil },
+        relationships: {
+          appPricePoint: { data: { type: "appPricePoints", id: point["id"] } }
+        }
+      }]
+    })
+    UI.success(":: App price set to #{cp.to_f.zero? ? 'Free' : cp} (base #{base})")
+  end
+
   lane :fetch_app_info do |options|
     require "spaceship"
     require "fileutils"
