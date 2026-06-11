@@ -105,6 +105,30 @@ SCHEME_CANDIDATES=$(xcodebuild -list $LIST_FLAG -json 2>/dev/null \
 
 SCHEME_COUNT=$(printf '%s\n' "$SCHEME_CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')
 
+# When a repo bundles local Swift packages, xcodebuild auto-creates a scheme per package
+# product (e.g. "AvocadoKit") on a fresh runner — those appear in `-list` but aren't app
+# schemes. If more than one candidate survives the name filter, narrow to schemes that match
+# an APPLICATION target of the .xcodeproj (read from the pbxproj). This drops non-app schemes
+# (Swift package products, libraries, frameworks) and lets the single app scheme auto-detect
+# — no per-repo `scheme:` input. Falls back to the existing behavior if app targets can't be
+# determined or if narrowing doesn't resolve to a single scheme.
+if [ "$SCHEME_COUNT" -gt 1 ] && [ -z "$SCHEME_OVERRIDE" ] && [ -n "$PROJECT" ] && [ -f "$PROJECT/project.pbxproj" ]; then
+  APP_TARGET_NAMES=$(plutil -convert json -o - "$PROJECT/project.pbxproj" 2>/dev/null \
+    | jq -r '.objects | to_entries[]
+              | select(.value.isa == "PBXNativeTarget" and .value.productType == "com.apple.product-type.application")
+              | .value.name' 2>/dev/null || true)
+  if [ -n "$APP_TARGET_NAMES" ]; then
+    NARROWED=$(printf '%s\n' "$SCHEME_CANDIDATES" | sed '/^$/d' \
+      | grep -Fxf <(printf '%s\n' "$APP_TARGET_NAMES" | sed '/^$/d') || true)
+    NARROWED_COUNT=$(printf '%s\n' "$NARROWED" | sed '/^$/d' | wc -l | tr -d ' ')
+    if [ "$NARROWED_COUNT" -ge 1 ] && [ "$NARROWED_COUNT" -lt "$SCHEME_COUNT" ]; then
+      echo ":: Narrowed schemes $SCHEME_COUNT→$NARROWED_COUNT: kept app-target schemes, dropped non-app (e.g. Swift package) schemes."
+      SCHEME_CANDIDATES="$NARROWED"
+      SCHEME_COUNT="$NARROWED_COUNT"
+    fi
+  fi
+fi
+
 if [ -n "$SCHEME_OVERRIDE" ]; then
   if ! printf '%s\n' "$SCHEME_CANDIDATES" | grep -Fx -- "$SCHEME_OVERRIDE" >/dev/null; then
     echo "ERROR: Scheme '$SCHEME_OVERRIDE' was not found. Available schemes:" >&2
