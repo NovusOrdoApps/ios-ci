@@ -122,7 +122,7 @@ if [ "$SCHEME_COUNT" -gt 1 ] && [ -z "$SCHEME_OVERRIDE" ] && [ -n "$PROJECT" ] &
       | grep -Fxf <(printf '%s\n' "$APP_TARGET_NAMES" | sed '/^$/d') || true)
     NARROWED_COUNT=$(printf '%s\n' "$NARROWED" | sed '/^$/d' | wc -l | tr -d ' ')
     if [ "$NARROWED_COUNT" -ge 1 ] && [ "$NARROWED_COUNT" -lt "$SCHEME_COUNT" ]; then
-      echo ":: Narrowed schemes $SCHEME_COUNT→$NARROWED_COUNT: kept app-target schemes, dropped non-app (e.g. Swift package) schemes."
+      echo ":: Narrowed schemes from ${SCHEME_COUNT} to ${NARROWED_COUNT}: kept app-target schemes, dropped non-app (e.g. Swift package) schemes."
       SCHEME_CANDIDATES="$NARROWED"
       SCHEME_COUNT="$NARROWED_COUNT"
     fi
