@@ -782,6 +782,51 @@ platform :ios do
   end
 
   # ──────────────────────────────────────────────
+  # release_approved_version  ("go live")
+  #
+  # Releases a version Apple has ALREADY APPROVED that is waiting in
+  # PENDING_DEVELOPER_RELEASE (i.e. submitted with manual release). Finds the
+  # most recent such version and presses Apple's "Release this version" button
+  # via the public ASC API (appStoreVersionReleaseRequests). Idempotent:
+  # a clean no-op (success) if nothing is pending developer release.
+  #
+  # This is the public, documented release API (JWT) — distinct from the build/
+  # upload/submit "Release iOS" flow (ios-release.yml).
+  lane :release_approved_version do |options|
+    require "spaceship"
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    bundle_id = ENV.fetch("APP_BUNDLE_ID")
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    UI.user_error!("App not found: #{bundle_id}") unless app
+
+    platform = Spaceship::ConnectAPI::Platform::IOS
+    # limit: nil → Spaceship auto-paginates (.all_pages) → every version.
+    versions = app.get_app_store_versions(filter: { platform: platform }, includes: "")
+
+    pending = versions.select { |v| v.app_store_state.to_s == "PENDING_DEVELOPER_RELEASE" }
+    target  = pending.max_by { |v| v.created_date.to_s } # most recent pending-release version
+
+    if target.nil?
+      recent = versions.sort_by { |v| v.created_date.to_s }.reverse.first(5)
+                       .map { |v| "#{v.version_string}=#{v.app_store_state}" }.join(", ")
+      UI.important("No version is pending developer release for #{bundle_id} — nothing to release.")
+      UI.message(":: A version must be Approved with manual release set (state PENDING_DEVELOPER_RELEASE).")
+      UI.message(":: Current versions: #{recent.empty? ? '(none)' : recent}")
+      next
+    end
+
+    UI.message(":: Releasing v#{target.version_string} (#{target.id}) — currently PENDING_DEVELOPER_RELEASE")
+    Spaceship::ConnectAPI.post_app_store_version_release_request(app_store_version_id: target.id)
+    UI.success("🚀 Release requested for v#{target.version_string} — it will go live on the App Store shortly.")
+  end
+
+  # ──────────────────────────────────────────────
   # update_metadata
   #
   # Uploads metadata and/or screenshots to App Store Connect.

@@ -1,0 +1,84 @@
+# Reusable workflow: "Go live" — release a version Apple has already APPROVED
+# that is waiting in PENDING_DEVELOPER_RELEASE (submitted with manual release).
+#
+# Finds the most recent version in PENDING_DEVELOPER_RELEASE and presses Apple's
+# "Release this version" button via the public ASC API
+# (appStoreVersionReleaseRequests). Idempotent: a clean no-op if nothing is
+# pending developer release. Makes NO build/upload — distinct from ios-release.yml.
+#
+# Credentials auto-resolve Class 1 (repo secrets) ↔ Class 2 (vault) like every
+# other ios-ci workflow. App bundle ID resolves from asc-app.jsonc → repo var.
+
+name: iOS Release Approved Version (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      team_slug:
+        description: "Override Environment auto-detect (Class 2). Leave empty for the common case."
+        required: false
+        type: string
+        default: ""
+      ruby_version:
+        description: "Ruby version for fastlane"
+        required: false
+        type: string
+        default: "3.2"
+
+concurrency:
+  group: ios-release-approved-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release approved version (go live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHECKOUT_PAT || github.token }}
+
+      - name: Checkout ios-ci tooling
+        uses: actions/checkout@v4
+        with:
+          repository: NovusOrdoApps/ios-ci
+          path: _ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby_version }}
+          bundler-cache: true
+          working-directory: _ci
+
+      - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
+        uses: ./_ci/.github/actions/resolve-asc-credentials
+        with:
+          gh_token:           ${{ secrets.CHECKOUT_PAT || github.token }}
+          team_slug:          ${{ inputs.team_slug }}
+          vault_pat:          ${{ secrets.VAULT_REPO_PAT }}
+          fallback_p8:        ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          fallback_key_id:    ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          fallback_issuer_id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          fallback_team_id:   ${{ vars.IOS_RELEASE_TEAM_ID }}
+
+      - name: Resolve app bundle ID (asc-app.jsonc → fallback to repo var)
+        uses: ./_ci/.github/actions/resolve-app-bundle-id
+        with:
+          fallback: ${{ vars.IOS_RELEASE_APP_BUNDLE_ID }}
+
+      - name: Validate inputs
+        run: |
+          : "${APP_BUNDLE_ID:?Missing app bundle ID (asc-app.jsonc or IOS_RELEASE_APP_BUNDLE_ID)}"
+          echo ":: App Bundle ID: $APP_BUNDLE_ID"
+
+      - name: Release approved version
+        working-directory: _ci
+        run: bundle exec fastlane release_approved_version
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
