@@ -1483,15 +1483,23 @@ platform :ios do
     app = find_iap_app_or_explain!(ENV.fetch("APP_BUNDLE_ID"))
     client = Spaceship::ConnectAPI.client.tunes_request_client
 
-    # The ageRatingDeclaration is a singleton, 1:1 with the app's appInfo.
-    resp = client.get("v1/apps/#{app.id}/appInfos", { "include" => "ageRatingDeclaration" }).body
-    decl = (resp["included"] || []).find { |x| x["type"] == "ageRatingDeclarations" }
-    decl_id = decl && decl["id"]
-    if decl_id.to_s.empty?
-      first_info = (resp["data"] || []).first
-      decl_id = first_info && first_info.dig("relationships", "ageRatingDeclaration", "data", "id")
+    # The ageRatingDeclaration is 1:1 with EACH appInfo. A live app exposes BOTH a
+    # locked (live) appInfo and an editable one, so it has two declarations; the
+    # locked one is read-only and PATCHing it 409s ("not editable"). Select the
+    # editable appInfo via Spaceship's state-aware accessor — the same one
+    # ensure_locales / fetch_metadata use — instead of guessing from an unfiltered
+    # appInfos list (which on a live app yields the locked declaration first).
+    app_info = app.fetch_edit_app_info
+    unless app_info
+      UI.user_error!("No editable App Info for #{ENV['APP_BUNDLE_ID']} — every appInfo is locked. " \
+        "Open a new App Store version (run the Update Metadata workflow) before setting the age rating.")
     end
-    UI.user_error!("Could not resolve ageRatingDeclaration id for #{ENV['APP_BUNDLE_ID']} (is the app created?)") if decl_id.to_s.empty?
+
+    # Resolve the EDITABLE appInfo's own declaration: this single GET returns both
+    # the id (to PATCH) and the current attributes (the idempotency baseline).
+    decl_resp = client.get("v1/appInfos/#{app_info.id}/ageRatingDeclaration").body
+    decl_id = decl_resp.dig("data", "id")
+    UI.user_error!("Could not resolve ageRatingDeclaration id for the editable appInfo of #{ENV['APP_BUNDLE_ID']} (is the app created?)") if decl_id.to_s.empty?
 
     # snake_case JSONC keys → Apple camelCase attributes ("v2" → "V2" via capitalize)
     desired = {}
@@ -1500,8 +1508,9 @@ platform :ios do
       desired[camel] = v
     end
 
-    current = (decl && decl["attributes"]) || {}
-    current = (client.get("v1/ageRatingDeclarations/#{decl_id}").body.dig("data", "attributes") || {}) if current.empty?
+    # Baseline comes from the SAME editable declaration we will PATCH (not the
+    # first declaration in an `included` blob, which on a live app is the live one).
+    current = decl_resp.dig("data", "attributes") || {}
     diff = desired.reject { |k, v| current.key?(k) && current[k] == v }
 
     if diff.empty?
@@ -1570,12 +1579,16 @@ platform :ios do
     app_infos = resp["data"] || []
     UI.user_error!("No appInfo for #{ENV['APP_BUNDLE_ID']} — create the app first (asc-init Step 2)") if app_infos.empty?
 
-    # Prefer an editable appInfo (skip locked/live states).
-    locked = %w[READY_FOR_DISTRIBUTION REPLACED_WITH_NEW_INFO REJECTED ACCEPTED].freeze
-    app_info = app_infos.find { |ai|
-      st = ai.dig("attributes", "appStoreState") || ai.dig("attributes", "state")
-      !locked.include?(st)
-    } || app_infos.first
+    # Select the EDITABLE appInfo (a live app also exposes a locked one, and
+    # PATCHing it 409s). Use Spaceship's state-aware accessor rather than a
+    # hand-maintained locked-state list, then map it back to the already-fetched
+    # list so we keep the included category relationships for the idempotency diff.
+    editable = app.fetch_edit_app_info
+    unless editable
+      UI.user_error!("No editable App Info for #{ENV['APP_BUNDLE_ID']} — every appInfo is locked. " \
+        "Open a new App Store version (run the Update Metadata workflow) before setting categories.")
+    end
+    app_info = app_infos.find { |ai| ai["id"] == editable.id } || app_infos.first
     app_info_id = app_info["id"]
 
     desired_rels = {}
