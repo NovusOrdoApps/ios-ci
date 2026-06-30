@@ -900,13 +900,13 @@ platform :ios do
 
     deliver_opts[:app_version] = options[:app_version] unless options[:app_version].to_s.empty?
 
-    if options[:skip_screenshots].to_s == "true"
-      deliver_opts[:skip_screenshots] = true
-    else
-      deliver_opts[:skip_screenshots] = false
-      deliver_opts[:screenshots_path] = options[:screenshots_path]
-      deliver_opts[:overwrite_screenshots] = true
-    end
+    # Screenshots are NEVER uploaded through deliver — they go through the
+    # dedicated `update_screenshots` lane instead. deliver's screenshot path
+    # races Apple's asynchronous asset processing and silently creates duplicate
+    # screenshots (see the long comment on `update_screenshots` for the full
+    # mechanism). So the text/metadata upload always runs with screenshots
+    # skipped, regardless of the caller's skip_screenshots value.
+    deliver_opts[:skip_screenshots] = true
 
     # ── New-app deliver guard ────────────────────────────────────────────
     # fastlane deliver's review_attachment_file calls
@@ -928,6 +928,218 @@ platform :ios do
     end
 
     deliver(deliver_opts)
+  end
+
+  # ──────────────────────────────────────────────
+  # update_screenshots
+  #
+  # Deterministic screenshot upload that BYPASSES fastlane `deliver`.
+  #
+  # WHY THIS EXISTS — deliver's screenshot path (upload_screenshots.rb in
+  # fastlane 2.236.x) uploads each image with wait_for_processing:false, then
+  # decides both "already uploaded?" and "did the upload succeed?" by matching
+  # each local file's MD5 against the `sourceFileChecksum` of the AppScreenshot
+  # rows on App Store Connect. While Apple is still ASYNCHRONOUSLY processing a
+  # freshly-uploaded asset, ASC returns a null/unstable sourceFileChecksum, so
+  # the just-uploaded file matches nothing → deliver reports it "is missing on
+  # App Store Connect" → it retries and uploads the SAME image AGAIN as a new
+  # row. That duplicate is never reconciled, and deliver's `sort_screenshots`
+  # then places the two identical rows next to each other — which is why two
+  # adjacent screenshots can show up identical on the store. The locales hit are
+  # simply the ones uploaded LAST (least processing head-start before verify).
+  #
+  # This lane removes every precondition for that race: it tracks the
+  # AppScreenshot IDs it creates in-process (never relies on sourceFileChecksum),
+  # uploads strictly sequentially, and BLOCKS on each asset reaching the COMPLETE
+  # delivery state before continuing. It also wipes each set first, so duplicates
+  # carried over from a prior version (Apple auto-copies screenshots into every
+  # new version) are cleared.
+  #
+  # Input layout = exactly what scripts/transform_screenshots.rb writes:
+  #   <screenshots_path>/<locale>/<DISPLAY_TYPE>_<NN>.png
+  #
+  # Requires an EDITABLE App Store version (screenshots can't be changed on a
+  # Ready-for-Sale-only version). Run AFTER update_metadata, which creates the
+  # editable version.
+  #
+  # Usage: bundle exec fastlane update_screenshots \
+  #          screenshots_path:/tmp/deliver-metadata/screenshots
+  # ──────────────────────────────────────────────
+  lane :update_screenshots do |options|
+    require "spaceship"
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    screenshots_path = options[:screenshots_path].to_s
+    UI.user_error!("Missing screenshots_path") if screenshots_path.empty?
+    UI.user_error!("screenshots_path not found: #{screenshots_path}") unless File.directory?(screenshots_path)
+
+    processing_timeout = (options[:processing_timeout] || ENV["SCREENSHOT_PROCESSING_TIMEOUT"] || 300).to_i
+    poll_interval = 3
+    max_per_set = 10 # Apple's hard cap per display type
+
+    # Apple display_type constants, longest-first so the longest matching
+    # filename prefix wins (e.g. APP_IPAD_PRO_3GEN_129 before APP_IPAD_PRO_129).
+    display_types = Spaceship::ConnectAPI::AppScreenshotSet::DisplayType::ALL.sort_by { |dt| -dt.length }
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    version = app.get_edit_app_store_version
+    if version.nil?
+      UI.user_error!(
+        "No EDITABLE App Store version found. Screenshots can only be set on an " \
+        "editable version — create/prepare a new version first (release.yml), then re-run.",
+      )
+    end
+
+    UI.message(":: Uploading screenshots to editable version #{version.version_string} (state: #{version.app_store_state})")
+
+    loc_by_locale = version.get_app_store_version_localizations.each_with_object({}) do |loc, h|
+      h[loc.locale] = loc
+    end
+
+    total = 0
+    locales = Dir.children(screenshots_path).select { |c| File.directory?(File.join(screenshots_path, c)) }.sort
+
+    locales.each do |locale|
+      loc = loc_by_locale[locale]
+      if loc.nil?
+        UI.important(":: Skipping #{locale}: no matching localization on the editable version.")
+        next
+      end
+
+      locale_dir = File.join(screenshots_path, locale)
+
+      # Group local files by display_type, preserving filename (NN) order.
+      files_by_type = Hash.new { |h, k| h[k] = [] }
+      Dir.children(locale_dir).select { |f| f =~ /\.png\z/i }.sort.each do |fname|
+        dt = display_types.find { |d| fname.start_with?("#{d}_") }
+        if dt.nil?
+          UI.user_error!(
+            "#{locale}/#{fname}: filename does not start with a known display_type prefix " \
+            "(expected <DISPLAY_TYPE>_<NN>.png, e.g. APP_IPHONE_67_01.png).",
+          )
+        end
+        files_by_type[dt] << File.join(locale_dir, fname)
+      end
+      next if files_by_type.empty?
+
+      # ── Full-locale wipe ─────────────────────────────────────────────────
+      # The repo is the source of truth for this locale: delete EVERY existing
+      # screenshot across ALL device families first, and drop any set whose
+      # device family the repo no longer provides. This guarantees the upload
+      # REPLACES whatever was on ASC (any count, any device family — including
+      # leftover duplicates carried over from a prior version) with exactly the
+      # screenshots currently in the repo for this locale.
+      disk_types = files_by_type.keys
+      loc.get_app_screenshot_sets(includes: "appScreenshots").each do |set|
+        dt = set.screenshot_display_type
+        (set.app_screenshots || []).each do |shot|
+          begin
+            shot.delete!
+          rescue => e
+            UI.important(":: #{locale}/#{dt}: retrying delete of #{shot.id} (#{e.message})")
+            shot.delete!
+          end
+        end
+        # Remove the whole set for device families the repo no longer provides,
+        # so stale device screenshots don't linger.
+        unless disk_types.include?(dt)
+          UI.message(":: #{locale}/#{dt}: removing set (no longer in repo)")
+          begin
+            set.delete!
+          rescue => e
+            UI.important(":: #{locale}/#{dt}: retrying set delete (#{e.message})")
+            set.delete! rescue nil
+          end
+        end
+      end
+
+      # Confirm the locale is fully cleared before re-uploading (ASC deletes are
+      # eventually consistent): no screenshots left in any set, no stale sets.
+      wipe_deadline = Time.now + 90
+      loop do
+        sets_now = loc.get_app_screenshot_sets(includes: "appScreenshots")
+        remaining = sets_now.sum { |s| (s.app_screenshots || []).size }
+        stale = sets_now.any? { |s| !disk_types.include?(s.screenshot_display_type) }
+        break if remaining.zero? && !stale
+        if Time.now > wipe_deadline
+          UI.user_error!("#{locale}: timed out clearing old screenshots (#{remaining} screenshot(s) left, stale sets: #{stale}).")
+        end
+        sleep poll_interval
+      end
+
+      # Re-fetch the surviving (now-empty) sets, indexed by display_type.
+      sets_by_type = loc.get_app_screenshot_sets
+                        .each_with_object({}) { |s, h| h[s.screenshot_display_type] = s }
+
+      files_by_type.each do |display_type, paths|
+        if paths.size > max_per_set
+          UI.user_error!("#{locale}/#{display_type}: #{paths.size} screenshots on disk exceeds Apple's max of #{max_per_set}.")
+        end
+
+        UI.message(":: #{locale}/#{display_type}: uploading #{paths.size} screenshot(s)")
+
+        # Reuse the wiped set or create one. NOTE: the create attribute key must
+        # be the camelCase JSON name (screenshotDisplayType) — it is sent verbatim
+        # in the POST body; the snake_case attr mapping only applies on READ.
+        set = sets_by_type[display_type] ||
+              loc.create_app_screenshot_set(attributes: { screenshotDisplayType: display_type })
+
+        # Upload each file ONCE, sequentially, blocking until COMPLETE. We never
+        # rely on sourceFileChecksum — we track the IDs we create and verify by
+        # count + order, so the deliver race cannot recur.
+        uploaded_ids = []
+        paths.each_with_index do |path, idx|
+          UI.message(":: #{locale}/#{display_type}: uploading #{File.basename(path)} (#{idx + 1}/#{paths.size})")
+          shot = set.upload_screenshot(path: path, wait_for_processing: false)
+
+          deadline = Time.now + processing_timeout
+          loop do
+            shot = Spaceship::ConnectAPI.get_app_screenshot(app_screenshot_id: shot.id).first
+            break if shot.complete?
+            if shot.error?
+              UI.user_error!("#{locale}/#{display_type}: processing FAILED for #{File.basename(path)} — #{shot.error_messages.join('; ')}")
+            end
+            if Time.now > deadline
+              state = (shot.asset_delivery_state || {})["state"]
+              UI.user_error!("#{locale}/#{display_type}: timed out after #{processing_timeout}s waiting for #{File.basename(path)} (last state: #{state.inspect}).")
+            end
+            sleep poll_interval
+          end
+
+          uploaded_ids << shot.id
+          total += 1
+        end
+
+        # Verify count, then enforce filename order.
+        final_shots = (Spaceship::ConnectAPI::AppScreenshotSet.get(
+          app_screenshot_set_id: set.id, includes: "appScreenshots",
+        ).app_screenshots || [])
+        if final_shots.size != paths.size
+          UI.user_error!("#{locale}/#{display_type}: post-upload count mismatch — ASC has #{final_shots.size}, expected #{paths.size}.")
+        end
+
+        if final_shots.map(&:id) != uploaded_ids
+          set.reorder_screenshots(app_screenshot_ids: uploaded_ids)
+          reordered = (Spaceship::ConnectAPI::AppScreenshotSet.get(
+            app_screenshot_set_id: set.id, includes: "appScreenshots",
+          ).app_screenshots || [])
+          if reordered.map(&:id) != uploaded_ids
+            UI.user_error!("#{locale}/#{display_type}: reorder did not stick — final order != filename order.")
+          end
+        end
+
+        UI.success(":: #{locale}/#{display_type}: #{paths.size} screenshot(s) uploaded, processed, ordered.")
+      end
+    end
+
+    UI.success("Uploaded #{total} screenshot(s) deterministically (deliver bypassed).")
   end
 
   # ──────────────────────────────────────────────

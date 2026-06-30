@@ -137,10 +137,22 @@ jobs:
         run: |
           bundle exec fastlane update_metadata \
             metadata_path:"$RUNNER_TEMP/deliver-metadata/metadata" \
-            screenshots_path:"$RUNNER_TEMP/deliver-metadata/screenshots" \
-            skip_screenshots:"${{ inputs.skip_screenshots }}" \
+            skip_screenshots:"true" \
             app_version:"${{ inputs.app_version }}" \
             update_promotional_text_only:"${{ inputs.update_promotional_text_only }}"
+
+      # Screenshots are uploaded by a dedicated, deterministic lane that bypasses
+      # deliver. deliver uploads screenshots before Apple finishes async asset
+      # processing, then re-uploads the ones it can't yet verify — silently
+      # creating duplicate screenshots. update_screenshots wipes each set and
+      # uploads sequentially, blocking on COMPLETE, so duplicates can't happen.
+      # Runs after update_metadata, which creates/opens the editable version.
+      - name: Upload screenshots to App Store Connect
+        if: ${{ inputs.skip_screenshots == false }}
+        working-directory: _ci
+        run: |
+          bundle exec fastlane update_screenshots \
+            screenshots_path:"$RUNNER_TEMP/deliver-metadata/screenshots"
 
       - name: Cleanup
         if: always()
