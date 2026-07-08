@@ -2259,7 +2259,20 @@ platform :ios do
     raise
   end
 
-  # 3-step Apple asset upload pattern. JWT-verified 2026-05-07.
+  # The current review screenshot resource for an IAP (id + attributes incl.
+  # sourceFileChecksum), or nil when none is set. An IAP holds at most one, so
+  # this is the relationship the caller must clear before uploading a new one.
+  def iap_review_screenshot_resource(iap_id:)
+    iap_client.get("v2/inAppPurchases/#{iap_id}/appStoreReviewScreenshot").body["data"]
+  rescue Spaceship::UnexpectedResponse => e
+    return nil if e.message =~ /404|not found/i
+    raise
+  end
+
+  # Idempotent replace + 3-step Apple asset upload. JWT-verified 2026-05-07.
+  #   0. If the IAP already has a review screenshot: skip when byte-identical
+  #      (same MD5), otherwise DELETE it (an IAP holds only one) so the create in
+  #      step 1 succeeds — this is what makes a re-sync actually replace it.
   #   1. POST /v1/inAppPurchaseAppStoreReviewScreenshots with fileSize+fileName
   #      → response includes uploadOperations array (URL+headers+offset+length)
   #   2. Execute each upload operation (PUT bytes to returned URL)
@@ -2275,6 +2288,19 @@ platform :ios do
     file_size = bytes.bytesize
     file_name = File.basename(path)
     checksum = Digest::MD5.hexdigest(bytes)
+
+    # An IAP holds exactly one review screenshot, so a bare create fails once one
+    # exists. Reconcile against the current one: skip when byte-identical (same
+    # MD5), else delete it first — so a re-sync replaces it like text fields update.
+    existing = iap_review_screenshot_resource(iap_id: iap_id)
+    if existing
+      if existing.dig("attributes", "sourceFileChecksum") == checksum
+        UI.message(":: review screenshot unchanged (checksum match) — skipping upload")
+        return existing["id"]
+      end
+      UI.message(":: replacing existing review screenshot #{existing['id']}")
+      iap_client.delete("v1/inAppPurchaseAppStoreReviewScreenshots/#{existing['id']}")
+    end
 
     create = iap_client.post("v1/inAppPurchaseAppStoreReviewScreenshots", {
       data: {
