@@ -1729,11 +1729,27 @@ platform :ios do
       UI.message(":: Age rating already at desired state; no PATCH sent")
       next
     end
+
+    # Apple added socialMedia + socialMediaAgeRestricted to the age-rating
+    # questionnaire (2026-07) and treats them as required. A declaration missing
+    # them is incomplete, so they ride along on every PATCH we send rather than
+    # only on the one run where they happen to differ — the same always-include
+    # rule appStoreReviewDetails' contact* fields need. An empty diff still
+    # short-circuits above, so this never turns a no-op into a write.
+    always_send = %w[socialMedia socialMediaAgeRestricted]
+    missing     = always_send.reject { |k| desired.key?(k) }
+    unless missing.empty?
+      UI.important(":: age_rating.jsonc does not define #{missing.join(', ')} — Apple now requires " \
+                   "#{missing.size == 1 ? 'it' : 'them'}. Add #{missing.map { |k| k.gsub(/([A-Z])/) { "_#{$1.downcase}" } }.join(', ')} " \
+                   "(see the template in asc-ops-workflow/templates/app-repo/metadata/AppInfo/age_rating.jsonc).")
+    end
+    payload = diff.merge(desired.slice(*always_send))
+
     client.patch("v1/ageRatingDeclarations/#{decl_id}", {
-      data: { type: "ageRatingDeclarations", id: decl_id, attributes: diff },
+      data: { type: "ageRatingDeclarations", id: decl_id, attributes: payload },
     })
     diff.each { |k, v| UI.success(":: ageRating #{k}: #{current[k].inspect} → #{v.inspect}") }
-    UI.success("Age rating saved (#{diff.size} field(s)). Apple auto-computes the final rating.")
+    UI.success("Age rating saved (#{diff.size} changed field(s)). Apple auto-computes the final rating.")
   end
 
   # ──────────────────────────────────────────────
