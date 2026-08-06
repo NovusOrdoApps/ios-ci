@@ -381,7 +381,9 @@ After upload, ios-ci attempts to transition each product to "Ready to Submit" so
 
 This lane iterates the **repo's** product folders, so a product that exists on App Store Connect but no longer has a folder is never touched again. That is easy to create by accident: commit a folder with a typo'd `product_id` once, the run creates it on Apple, then delete the folder — the product stays forever, stuck in `MISSING_METADATA`, and shows up as a submission blocker that no workflow can clear.
 
-Every run now **reports** such orphans:
+Pruning runs **before** products are created or updated, and that order is load-bearing: Apple requires a product's reference name to be unique within the account, so an orphan holding the name a repo product wants blocks that product until it is gone. Deleting afterwards would report the collision and remove its cause in the same run, leaving the real product broken until someone ran the workflow a second time.
+
+Every run **reports** such orphans:
 
 ```
 :: 1 IAP(s) on App Store Connect have no folder in metadata/InAppPurchases/:
