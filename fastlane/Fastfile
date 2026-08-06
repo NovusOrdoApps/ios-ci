@@ -1164,6 +1164,13 @@ platform :ios do
     UI.user_error!("Missing input_path") if input_path.to_s.empty?
     UI.user_error!("IAP input file not found: #{input_path}") unless File.exist?(input_path)
 
+    # Deleting products on App Store Connect is opt-in, and deliberately not
+    # the default: this lane is shared by every app in the org, and a repo that
+    # simply has not committed its IAP folders yet must never have its live
+    # products removed because of it. Orphans are *reported* on every run
+    # regardless — see the block after the product loop.
+    prune_orphans = options[:prune_orphans].to_s == "true"
+
     app_store_connect_api_key(
       key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
       issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
@@ -1291,8 +1298,58 @@ platform :ios do
       end
     end
 
+    # ── Orphans: products on ASC with no folder in the repo ──────────
+    #
+    # Always reported, deleted only when asked. Silence here is precisely how
+    # a mistyped product id survives forever: committing a folder once creates
+    # the product on Apple, deleting the folder afterwards removes nothing,
+    # and no later run so much as mentions it — because this lane iterates the
+    # repo's products, never ASC's. The orphan then sits in MISSING_METADATA
+    # and shows up as a submission blocker that no workflow can clear.
+    #
+    # Only states that have never reached review are eligible. An IAP that has
+    # been approved may have been purchased, and deleting it would break
+    # restores for those customers; Apple rejects the call anyway, so refusing
+    # here turns a confusing API error into an explanation.
+    prunable_states = %w[MISSING_METADATA READY_TO_SUBMIT].freeze
+    orphan_ids = existing.keys - products.map { |p| p["product_id"] }
+    deleted_count = 0
+
+    unless orphan_ids.empty?
+      UI.important(":: #{orphan_ids.size} IAP(s) on App Store Connect have no folder in metadata/InAppPurchases/:")
+      orphan_ids.each do |pid|
+        UI.important("::   #{pid} (state=#{existing[pid].dig('attributes', 'state')})")
+      end
+
+      if prune_orphans
+        orphan_ids.each do |pid|
+          iap   = existing[pid]
+          state = iap.dig("attributes", "state").to_s
+          unless prunable_states.include?(state)
+            warnings << "#{pid}: refusing to delete — state is #{state}, not one of " \
+                        "#{prunable_states.join(', ')}. A product that reached review or sale " \
+                        "can only be removed from sale in App Store Connect, never deleted."
+            next
+          end
+
+          begin
+            delete_iap(iap.fetch("id"))
+            deleted_count += 1
+            UI.success(":: deleted orphan IAP '#{pid}' (was #{state})")
+          rescue StandardError => e
+            warnings << "#{pid}: delete failed: #{e.message}"
+          end
+        end
+      else
+        UI.important(":: Leaving them alone. Re-run with prune_orphans:true " \
+                     "(workflow input 'prune_orphans') to delete the ones never submitted.")
+      end
+    end
+
     warnings.each { |w| UI.important(":: #{w}") }
-    UI.success("Processed #{products.length} IAP(s)#{warnings.any? ? " with #{warnings.size} warning(s)" : ''}.")
+    UI.success("Processed #{products.length} IAP(s)" \
+               "#{deleted_count.positive? ? ", deleted #{deleted_count} orphan(s)" : ''}" \
+               "#{warnings.any? ? " with #{warnings.size} warning(s)" : ''}.")
   end
 
   # ──────────────────────────────────────────────
@@ -2094,6 +2151,17 @@ platform :ios do
       }
     )
     resp.body["data"]
+  end
+
+  # DELETE /v2/inAppPurchases/<id> — remove an IAP from App Store Connect.
+  #
+  # Apple permits this only while the product has never been through review.
+  # Once approved or sold it can be removed from sale but never deleted, and
+  # the API rejects the call rather than silently ignoring it. Callers must
+  # gate on `state` first — `update_iap`'s orphan block is the only caller and
+  # does exactly that.
+  def delete_iap(iap_id)
+    iap_client.delete("v2/inAppPurchases/#{iap_id}")
   end
 
   # PATCH /v2/inAppPurchases/<id> — update name / familySharable etc.

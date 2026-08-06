@@ -360,14 +360,39 @@ name: Update In-App Purchases
 
 on:
   workflow_dispatch:
+    inputs:
+      prune_orphans:
+        description: 'Delete IAPs on ASC that no longer exist in metadata/InAppPurchases/'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   iap:
     uses: your-org/ios-ci/.github/workflows/ios-iap.yml@main
+    with:
+      prune_orphans: ${{ inputs.prune_orphans }}
     secrets: inherit
 ```
 
 After upload, ios-ci attempts to transition each product to "Ready to Submit" so it ships with the next app version review. Products that don't qualify (e.g. missing review screenshot on first creation) emit a warning but don't fail the workflow.
+
+### Orphaned products (`prune_orphans`)
+
+This lane iterates the **repo's** product folders, so a product that exists on App Store Connect but no longer has a folder is never touched again. That is easy to create by accident: commit a folder with a typo'd `product_id` once, the run creates it on Apple, then delete the folder — the product stays forever, stuck in `MISSING_METADATA`, and shows up as a submission blocker that no workflow can clear.
+
+Every run now **reports** such orphans:
+
+```
+:: 1 IAP(s) on App Store Connect have no folder in metadata/InAppPurchases/:
+::   com.example.pro1 (state=MISSING_METADATA)
+:: Leaving them alone. Re-run with prune_orphans:true to delete the ones never submitted.
+```
+
+Pass `prune_orphans: true` to delete them. Two guards, both deliberate:
+
+- **Off by default.** A repo that has not committed its IAP folders yet must never have its live products deleted as a side effect of a routine sync.
+- **Only products that never reached review** (`MISSING_METADATA`, `READY_TO_SUBMIT`) are eligible. Anything approved or sold is refused with a warning rather than attempted — it may have been purchased, deleting it would break restores, and Apple rejects the call regardless. Remove those from sale in App Store Connect instead.
 
 ### IAP sync caller workflow
 

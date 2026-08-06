@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "macos-26"
+      prune_orphans:
+        description: "Delete IAPs on ASC that have no folder in metadata/InAppPurchases/. Only products that never reached review are eligible; approved or sold ones are refused. Off by default — orphans are reported either way."
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ios-iap-${{ github.repository }}-${{ github.ref }}
@@ -98,7 +103,8 @@ jobs:
         working-directory: _ci
         run: |
           bundle exec fastlane update_iap \
-            input_path:"$RUNNER_TEMP/iap-normalized.json"
+            input_path:"$RUNNER_TEMP/iap-normalized.json" \
+            prune_orphans:"${{ inputs.prune_orphans }}"
 
       - name: Cleanup
         if: always()
