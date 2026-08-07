@@ -1358,7 +1358,19 @@ platform :ios do
         end
       else
         UI.message(":: #{pid}: skipping independent submit (no live version). " \
-                   "Will be attached to v1 review by asc-ops-workflow's attach_in_app_items_to_next_version lane (run via submit.yml).")
+                   "Will be attached to the v1 review submission by asc-ops-workflow's submit_review_session (run via submit.yml).")
+      end
+
+      # Read back what Apple now holds. attributes.state is a stale-prone legacy attribute
+      # post-ASC-4.4.1 (a complete product can report MISSING_METADATA for hours; the ASC UI
+      # ignores it and renders the version state) — logged for the record, never gated on.
+      begin
+        rb = iap_client.get("v2/inAppPurchases/#{iap_id}", { "include" => "versions" }).body
+        ver = (rb["included"] || []).find { |x| x["type"] == "inAppPurchaseVersions" }
+        UI.message(":: #{pid}: read-back — version state=#{ver ? ver.dig('attributes', 'state') : 'n/a'}, " \
+                   "product state attr=#{rb.dig('data', 'attributes', 'state')} (stale-prone)")
+      rescue StandardError => e
+        UI.message(":: #{pid}: state read-back failed (non-fatal): #{e.message}")
       end
     end
 
