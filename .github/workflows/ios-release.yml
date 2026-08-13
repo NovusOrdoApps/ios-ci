@@ -350,7 +350,22 @@ jobs:
           if [ "${{ inputs.automatic_signing }}" = "true" ]; then
             echo "style=automatic" >> "$GITHUB_OUTPUT"
             echo "skip_profiles=true" >> "$GITHUB_OUTPUT"
-            echo "xcargs=-allowProvisioningUpdates -authenticationKeyPath $ASC_KEY_P8_PATH -authenticationKeyID $APP_STORE_CONNECT_KEY_ID -authenticationKeyIssuerID $APP_STORE_CONNECT_ISSUER_ID" >> "$GITHUB_OUTPUT"
+
+            # xcodebuild wants the key file to carry its key ID: AuthKey_<KEYID>.p8. Handed
+            # a differently-named file it reports "Authentication failed: Make sure a bearer
+            # token was provided, it is properly configured and signed, and it has not
+            # expired" — which reads like a bad key and is not one. The same file
+            # authenticates fine through Spaceship moments earlier in install_profiles,
+            # because the App Store Connect API takes the key ID as a parameter while
+            # xcodebuild's Developer-portal path leans on the filename convention.
+            #
+            # Copy rather than rename: ASC_KEY_P8_PATH is what every other lane and the
+            # cleanup step reference, and this branch must not disturb them.
+            NAMED_KEY="$(dirname "$ASC_KEY_P8_PATH")/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+            cp "$ASC_KEY_P8_PATH" "$NAMED_KEY"
+            chmod 600 "$NAMED_KEY"
+
+            echo "xcargs=-allowProvisioningUpdates -authenticationKeyPath $NAMED_KEY -authenticationKeyID $APP_STORE_CONNECT_KEY_ID -authenticationKeyIssuerID $APP_STORE_CONNECT_ISSUER_ID" >> "$GITHUB_OUTPUT"
 
             # Hand match ONLY the application target's bundle ID.
             #
@@ -621,4 +636,7 @@ jobs:
 
       - name: Remove API key
         if: always()
-        run: rm -f "$RUNNER_TEMP/asc-secrets/AuthKey.p8"
+        # The glob also catches the AuthKey_<KEYID>.p8 copy the automatic-signing branch
+        # makes for xcodebuild. Leaving a private key on a runner is not acceptable even
+        # when the runner is ephemeral.
+        run: rm -f "$RUNNER_TEMP"/asc-secrets/AuthKey*.p8

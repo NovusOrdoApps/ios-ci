@@ -99,13 +99,21 @@ platform :ios do
       UI.message("Setting signing for target '#{t['name']}' → #{t['bundle_id']} (#{automatic ? 'automatic' : 'manual'})")
 
       if automatic
-        # No profile_name and no code_sign_identity: naming either one pins the target back to
-        # a specific match profile/identity, which is the thing automatic signing is here to
-        # stop doing. Xcode resolves both from the team plus the target's entitlements.
+        # No profile_name — that is the part that pins a target to a specific match profile,
+        # and picking the profile is what automatic signing is here to do.
+        #
+        # CODE_SIGN_IDENTITY still has to be set, though. Leaving it unset does not mean
+        # "let Xcode decide the right thing for an archive": update_code_signing_settings
+        # simply does not write the setting, Xcode falls back to "Apple Development", and the
+        # archive then hunts for an *iOS App Development* profile — which is not what a
+        # release build wants and not what the match certificate in the CI keychain is.
+        # Naming the distribution identity tells automatic signing which class of profile to
+        # provision without naming the profile itself.
         update_code_signing_settings(
           use_automatic_signing: true,
           team_id: team_id,
           targets: [t["name"]],
+          code_sign_identity: "Apple Distribution",
           bundle_identifier: t["bundle_id"],
           path: xcodeproj,
         )
