@@ -343,16 +343,38 @@ jobs:
       # export cannot disagree about which mode they are in.
       - name: Resolve signing mode
         id: signing
+        env:
+          TARGETS_JSON: ${{ steps.detect.outputs.targets_json }}
+          ALL_APP_IDS: ${{ steps.detect.outputs.app_identifiers }}
         run: |
           if [ "${{ inputs.automatic_signing }}" = "true" ]; then
             echo "style=automatic" >> "$GITHUB_OUTPUT"
             echo "skip_profiles=true" >> "$GITHUB_OUTPUT"
             echo "xcargs=-allowProvisioningUpdates -authenticationKeyPath $ASC_KEY_P8_PATH -authenticationKeyID $APP_STORE_CONNECT_KEY_ID -authenticationKeyIssuerID $APP_STORE_CONNECT_ISSUER_ID" >> "$GITHUB_OUTPUT"
+
+            # Hand match ONLY the application target's bundle ID.
+            #
+            # skip_provisioning_profiles stops match creating profiles, but it does NOT stop
+            # match validating every app_identifier it was given: runner.rb verifies each one
+            # exists on the portal BEFORE it fetches the certificate, outside that guard. Under
+            # automatic signing the extensions' App IDs are exactly what does not exist yet —
+            # xcodebuild registers them during the archive — so passing them here aborts the
+            # run before the certificate it is actually being called for is ever installed.
+            # The app's own App ID always exists by this point; the certificate is per-team
+            # anyway, so the list has no bearing on which cert comes back.
+            CERT_IDS=$(printf '%s' "$TARGETS_JSON" | jq -r '[.[] | select(.product_type == "com.apple.product-type.application") | .bundle_id] | join(",")')
+            if [ -z "$CERT_IDS" ]; then
+              CERT_IDS="$ALL_APP_IDS"
+            fi
+            echo "match_app_identifiers=$CERT_IDS" >> "$GITHUB_OUTPUT"
+
             echo ":: Signing: automatic (xcodebuild provisions App IDs and capabilities)"
+            echo ":: match receives certificate-only scope: $CERT_IDS"
           else
             echo "style=manual" >> "$GITHUB_OUTPUT"
             echo "skip_profiles=false" >> "$GITHUB_OUTPUT"
             echo "xcargs=" >> "$GITHUB_OUTPUT"
+            echo "match_app_identifiers=$ALL_APP_IDS" >> "$GITHUB_OUTPUT"
             echo ":: Signing: manual (match profiles)"
           fi
 
@@ -382,7 +404,7 @@ jobs:
         run: |
           bundle exec fastlane install_profiles \
             type:appstore \
-            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}" \
+            app_identifiers:"${{ steps.signing.outputs.match_app_identifiers }}" \
             skip_provisioning_profiles:"${{ steps.signing.outputs.skip_profiles }}"
 
       - name: Set app-store code signing
@@ -477,7 +499,7 @@ jobs:
         run: |
           bundle exec fastlane install_profiles \
             type:adhoc \
-            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}" \
+            app_identifiers:"${{ steps.signing.outputs.match_app_identifiers }}" \
             skip_provisioning_profiles:"${{ steps.signing.outputs.skip_profiles }}"
 
       - name: Set ad-hoc code signing
