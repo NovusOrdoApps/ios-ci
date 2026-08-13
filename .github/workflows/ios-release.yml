@@ -67,11 +67,15 @@ on:
         default: false
       automatic_signing:
         description: >-
-          Sign with Xcode automatic signing instead of match profiles. Leave false unless the
-          app needs App IDs that match cannot provision on its own — App Groups and Network
-          Extensions, i.e. an app embedding a tunnel or widget extension. When true, match
-          still supplies the distribution certificate but xcodebuild registers the App IDs,
-          enables their capabilities from each target's entitlements, and issues the profiles.
+          Sign with Xcode automatic signing instead of match profiles. ⚠️ PROVEN LIMIT: this
+          CANNOT work for any target whose entitlements reference an App Group —
+          /xcbuild/v1/appGroups returns 401 NOT_AUTHORIZED for API-key sessions regardless of
+          key role, format, or egress IP (established from the unified log of vpnguard run
+          31697950266; each attempt also mints a stray Development certificate). App-Group
+          apps must pre-provision via asc-ops-workflow's provision-app-ids session lane and
+          stay on match. This input remains for the hypothetical extension app WITHOUT App
+          Groups; when true, match supplies only the distribution certificate and xcodebuild
+          registers App IDs, enables capabilities, and issues profiles.
         required: false
         type: boolean
         default: false
