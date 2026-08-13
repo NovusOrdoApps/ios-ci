@@ -178,7 +178,26 @@ if [ -z "$SCHEME_SETTINGS" ]; then
   exit 1
 fi
 
+# A scheme only enumerates the targets in its OWN build action. An app that embeds
+# extensions (network extension, widgets) lists just the app there and pulls the rest in as
+# implicit dependencies — so the extensions' bundle IDs never appear, never reach match, and
+# the archive dies with "No profiles for '<app>.tunnel' were found". Ask the project for
+# every target as well and union the two: this can only ADD signable targets, never drop one.
+# Test bundles and non-signable targets are removed by the PRODUCT_TYPE filter below, exactly
+# as they already are for the scheme query.
+ALLTARGET_SETTINGS=$(xcodebuild -showBuildSettings -project "$PROJECT" -alltargets -configuration "$CONFIGURATION" 2>>"$XCB_STDERR" || true)
+
 rm -f "$XCB_STDERR"
+
+# Drop xcodebuild's preamble ("Command line invocation:", "Resolve Package Graph", ...) so the
+# blob starts on a target header. Without this the preamble lands INSIDE the last block of the
+# scheme output, because the per-target awk below only stops at the next target header.
+ALLTARGET_SETTINGS=$(printf '%s\n' "$ALLTARGET_SETTINGS" \
+  | sed -n '/^Build settings for action build and target /,$p')
+
+# Order matters: the scheme's blocks come first, so the awk extraction below — which stops at
+# the next target header — reads the scheme's copy of any target present in both.
+SCHEME_SETTINGS=$(printf '%s\n%s\n' "$SCHEME_SETTINGS" "$ALLTARGET_SETTINGS")
 
 TARGETS_RAW=$(printf '%s\n' "$SCHEME_SETTINGS" \
   | sed -n 's/^Build settings for action build and target \(.*\):$/\1/p' \
@@ -199,6 +218,10 @@ TEAM_ID=""
 while IFS= read -r target; do
   [ -z "$target" ] && continue
 
+  # `done` rather than `exit`: this awk is fed EVERY target's settings, so exiting at the end
+  # of the wanted block would close the pipe with megabytes still queued in `printf` — SIGPIPE,
+  # status 141 via pipefail, and `set -e` kills the script mid-loop with no message. Keep
+  # draining stdin and just stop printing.
   SETTINGS=$(printf '%s\n' "$SCHEME_SETTINGS" | awk -v target="$target" '
     $0 == "Build settings for action build and target " target ":" {
       in_target = 1
@@ -206,10 +229,10 @@ while IFS= read -r target; do
     }
     /^Build settings for action build and target / {
       if (in_target) {
-        exit
+        done = 1
       }
     }
-    in_target {
+    in_target && !done {
       print
     }
   ')
@@ -218,9 +241,14 @@ while IFS= read -r target; do
   # returns exit 1 on no-match, which under `set -euo pipefail` would silently
   # exit the script. xcodebuild omits empty settings from output, so any setting
   # set to "" in the project won't appear — we must tolerate that gracefully.
-  BUNDLE_ID=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER[[:space:]]*=/ {print $2; exit}' | xargs)
-  PRODUCT_TYPE=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*PRODUCT_TYPE[[:space:]]*=/ {print $2; exit}' | xargs)
-  TARGET_TEAM=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ {print $2; exit}' | xargs)
+  #
+  # These awks must also read to EOF rather than `exit`-ing on the first match. Exiting closes
+  # the pipe while `printf` is still writing, and once a settings block exceeds the 64K pipe
+  # buffer that write takes SIGPIPE — which `pipefail` turns into status 141 and `set -e` turns
+  # into a silent abort three lines into the loop. Same class of trap as the grep note above.
+  BUNDLE_ID=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '!f && /^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER[[:space:]]*=/ {print $2; f=1}' | xargs)
+  PRODUCT_TYPE=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '!f && /^[[:space:]]*PRODUCT_TYPE[[:space:]]*=/ {print $2; f=1}' | xargs)
+  TARGET_TEAM=$(printf '%s\n' "$SETTINGS" | awk -F ' = ' '!f && /^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=/ {print $2; f=1}' | xargs)
 
   # Skip targets without bundle IDs or non-app targets (frameworks, tests)
   [ -z "$BUNDLE_ID" ] && continue
