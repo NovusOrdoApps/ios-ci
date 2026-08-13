@@ -75,6 +75,16 @@ on:
         required: false
         type: boolean
         default: false
+      socks5_url:
+        description: >-
+          Per-entity residential SOCKS5 egress (socks5://user:pass@host:port). Blank = direct.
+          Routes the job's Apple traffic through the proxy via asc-ops-workflow's contained
+          TUN — pass it when Apple's developer-services endpoints reject the runner's
+          datacenter IP (the session workflows already require this; xcodebuild's
+          -allowProvisioningUpdates path talks to the same infrastructure).
+        required: false
+        type: string
+        default: ""
       app_version:
         description: "Marketing version to release (e.g. '1.2.3'). Must be in semver format."
         required: true
@@ -148,6 +158,16 @@ jobs:
           ruby-version: ${{ inputs.ruby_version }}
           bundler-cache: true
           working-directory: _ci
+
+      # Optional residential egress for Apple traffic. Contained-route: ONLY the pinned Apple
+      # hosts (incl. developerservices2.apple.com, which xcodebuild's provisioning path uses)
+      # plus 17/8 go through the TUN; GitHub, gems, go.dev etc. stay direct. No-op when the
+      # input is blank. Tears itself down at job end via the action's post: hook.
+      - name: Bring up SOCKS5 egress for Apple traffic
+        if: inputs.socks5_url != ''
+        uses: NovusOrdoApps/asc-ops-workflow/.github/actions/socks5-egress@main
+        with:
+          socks5_url: ${{ inputs.socks5_url }}
 
       - name: Resolve ASC credentials (Class 1 secrets ↔ Class 2 vault)
         uses: ./_ci/.github/actions/resolve-asc-credentials
@@ -363,7 +383,21 @@ jobs:
             # cleanup step reference, and this branch must not disturb them.
             NAMED_KEY="$(dirname "$ASC_KEY_P8_PATH")/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
             cp "$ASC_KEY_P8_PATH" "$NAMED_KEY"
+            # Guarantee a trailing newline. Vault keys minted through the iris API are the
+            # raw Base64-decoded bytes and end on the PEM footer with no \n; keys downloaded
+            # from Apple's UI end with one. Ruby's OpenSSL accepts both — which is why
+            # Spaceship authenticates with this same file — but stricter PEM parsers do not,
+            # and xcodebuild's "Authentication failed: Make sure a bearer token was
+            # provided" names the token, not the file, when the key never parsed.
+            [ -n "$(tail -c1 "$NAMED_KEY")" ] && printf '\n' >> "$NAMED_KEY"
             chmod 600 "$NAMED_KEY"
+
+            # Also stage at the canonical location Apple's tools search on their own
+            # (~/.appstoreconnect/private_keys). -authenticationKeyPath should make this
+            # redundant; documented reality is that parts of the provisioning stack consult
+            # the search path regardless. Cheap, and removed in cleanup.
+            mkdir -p "$HOME/.appstoreconnect/private_keys"
+            cp "$NAMED_KEY" "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
 
             echo "xcargs=-allowProvisioningUpdates -authenticationKeyPath $NAMED_KEY -authenticationKeyID $APP_STORE_CONNECT_KEY_ID -authenticationKeyIssuerID $APP_STORE_CONNECT_ISSUER_ID" >> "$GITHUB_OUTPUT"
 
@@ -644,6 +678,22 @@ jobs:
           cp -R "$HOME/Library/Logs/gym/." "$RUNNER_TEMP/build-logs/" 2>/dev/null \
             || echo ":: no gym logs found (failure happened before any xcodebuild run)"
 
+          # xcodebuild's stdout carries a one-line summary of provisioning failures
+          # ("Authentication failed: ...") with none of Apple's response attached — the
+          # actual developer-services HTTP exchange goes to the macOS unified log. Pull the
+          # last 30 minutes for the build processes, plus a pre-filtered slice of the
+          # auth/provisioning lines so the interesting part is readable without paging
+          # through the full dump.
+          log show --last 30m --info --debug \
+            --predicate 'process == "xcodebuild" OR process == "XCBBuildService"' \
+            > "$RUNNER_TEMP/build-logs/unified-xcodebuild.log" 2>&1 \
+            || echo ":: log show failed" > "$RUNNER_TEMP/build-logs/unified-xcodebuild.log"
+          grep -iE "auth|token|provision|developerservices|bearer|401|403|denied" \
+            "$RUNNER_TEMP/build-logs/unified-xcodebuild.log" \
+            > "$RUNNER_TEMP/build-logs/unified-auth-slice.log" || true
+          gzip -f "$RUNNER_TEMP/build-logs/unified-xcodebuild.log"
+          echo ":: unified log staged ($(wc -l < "$RUNNER_TEMP/build-logs/unified-auth-slice.log" | tr -d ' ') auth-related lines)"
+
       - name: Upload raw xcodebuild logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -662,6 +712,9 @@ jobs:
       - name: Remove API key
         if: always()
         # The glob also catches the AuthKey_<KEYID>.p8 copy the automatic-signing branch
-        # makes for xcodebuild. Leaving a private key on a runner is not acceptable even
-        # when the runner is ephemeral.
-        run: rm -f "$RUNNER_TEMP"/asc-secrets/AuthKey*.p8
+        # makes for xcodebuild, and the canonical-search-path copy under
+        # ~/.appstoreconnect/private_keys. Leaving a private key on a runner is not
+        # acceptable even when the runner is ephemeral.
+        run: |
+          rm -f "$RUNNER_TEMP"/asc-secrets/AuthKey*.p8
+          rm -f "$HOME"/.appstoreconnect/private_keys/AuthKey*.p8
