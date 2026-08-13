@@ -74,7 +74,27 @@ platform :ios do
 
     match_opts[:force_for_new_devices] = true if type.to_s == "adhoc"
 
-    match(match_opts)
+    begin
+      match(match_opts)
+    rescue => e
+      # match validates every bundle ID against the portal before touching
+      # certificates, so a missing App ID dies here with "Couldn't find bundle
+      # identifier ..." — and WHICH workflow should have created it depends on
+      # the kind of app. Say so, because the fix is a prerequisite run, not a
+      # code change, and it is easy to forget on a first release.
+      if e.message =~ /Couldn't find bundle identifier|Could not find App ID/i
+        hint =
+          "An App ID in [#{ids.join(', ')}] is not registered on the Developer portal. " \
+          "Multi-target app (extensions / App Groups — detect_all_targets:true): dispatch the " \
+          "app repo's 'Provision App IDs' workflow first (asc-ops-workflow provision-app-ids; " \
+          "reads asc-provisioning.jsonc, needs socks5_url) — one-time before the first release, " \
+          "re-run only when entitlements change. Single-target app: run asc-init " \
+          "(registers the bundle ID via REST)."
+        UI.error(hint)
+        puts("::error title=App ID missing on the Developer portal::#{hint}")
+      end
+      raise
+    end
   end
 
   # ──────────────────────────────────────────────

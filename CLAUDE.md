@@ -94,3 +94,35 @@ Both `transform_metadata.rb` and `Fastfile submit_for_review` parse JSONC by han
 - All lanes pass values through env or positional kwargs (`fastlane <lane> key:value`); `Appfile` is intentionally empty.
 - Caller-repo path is always the GitHub Actions checkout root; this repo is checked out into `_ci/` alongside it. When testing scripts locally against an app repo, mimic that layout by passing the app repo as `app_root` and running scripts via `bundle exec` from the `ios-ci` checkout.
 - The repo is consumed by callers referencing `@main` by default; breaking changes to workflow inputs or script CLIs need to be coordinated with caller repos or pinned via tags.
+
+## Multi-target apps (embedded extensions / App Groups) — the opt-in recipe
+
+Default behavior is single-target: target discovery is scheme-only, signing is match. **~20 app
+repos ride these defaults — never change them.** An app whose scheme lists only the main target
+while other Xcode targets exist (tests, helpers, a second app target) is exactly the case the
+default protects: those targets stay invisible to signing unless a repo explicitly opts in.
+
+An app that EMBEDS extensions (network extension, widgets) whose entitlements need capabilities
+(App Groups, Network Extensions) needs three things — all in the APP repo, nothing in ios-ci:
+
+1. **`asc-provisioning.jsonc`** at the repo root — declares every signable bundle ID, its
+   capabilities, and the App Groups with their assignments. Template + caller workflow:
+   `asc-ops-workflow/templates/app-repo/`. Reference implementation: the `vpnguard` repo.
+2. **`.github/workflows/provision-app-ids.yml`** caller (template above). Dispatch it ONCE
+   (with `socks5_url` — it is a vault-session lane) BEFORE the first release; re-run only when
+   entitlements change. It registers missing App IDs, enables capabilities, creates and
+   associates App Groups over the cookie session. Idempotent.
+3. **`detect_all_targets: true`** in the release caller's `with:` block — makes target
+   discovery union `-alltargets` with the scheme so the extensions' bundle IDs reach match.
+
+Signing stays **match** (`automatic_signing` stays false). Do NOT reach for `automatic_signing`
+to solve capabilities: Apple's `/xcbuild/v1/appGroups` rejects API-key sessions categorically
+(401 NOT_AUTHORIZED — proven, vpnguard run 31700032118's predecessors), so automatic signing can
+never finish for an App-Group app, and each attempt mints a stray Development certificate.
+
+If a first release fails in `install_profiles` with "Couldn't find bundle identifier", the
+provisioning run was skipped — the lane's error text says which workflow to dispatch.
+
+Useful facts: Apple marks existing profiles Invalid when their App ID gains capabilities, and
+match regenerates Invalid profiles on its own. `dns-settings` is an option under the Network
+Extensions capability, not a separate portal toggle.
