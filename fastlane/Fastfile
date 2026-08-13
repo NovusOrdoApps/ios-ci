@@ -99,21 +99,23 @@ platform :ios do
       UI.message("Setting signing for target '#{t['name']}' → #{t['bundle_id']} (#{automatic ? 'automatic' : 'manual'})")
 
       if automatic
-        # No profile_name — that is the part that pins a target to a specific match profile,
-        # and picking the profile is what automatic signing is here to do.
+        # Neither profile_name NOR code_sign_identity. Both are Xcode's to choose here, and
+        # pinning either one is an error rather than a hint:
         #
-        # CODE_SIGN_IDENTITY still has to be set, though. Leaving it unset does not mean
-        # "let Xcode decide the right thing for an archive": update_code_signing_settings
-        # simply does not write the setting, Xcode falls back to "Apple Development", and the
-        # archive then hunts for an *iOS App Development* profile — which is not what a
-        # release build wants and not what the match certificate in the CI keychain is.
-        # Naming the distribution identity tells automatic signing which class of profile to
-        # provision without naming the profile itself.
+        #   VPNGuard has conflicting provisioning settings. VPNGuard is automatically signed
+        #   for development, but a conflicting code signing identity Apple Distribution has
+        #   been manually specified.
+        #
+        # Signing "for development" during the archive is correct and not a mistake to
+        # correct — the export re-signs with the distribution identity, which is why
+        # export_xcargs carries -allowProvisioningUpdates too. If you are here because an
+        # archive complained it could not find an *iOS App Development* profile, that is
+        # almost certainly authentication failing upstream rather than the wrong identity:
+        # xcodebuild reports "no profiles found" when it was unable to create one.
         update_code_signing_settings(
           use_automatic_signing: true,
           team_id: team_id,
           targets: [t["name"]],
-          code_sign_identity: "Apple Distribution",
           bundle_identifier: t["bundle_id"],
           path: xcodeproj,
         )
