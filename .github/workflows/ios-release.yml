@@ -628,6 +628,31 @@ jobs:
           echo "ERROR: Diawi processing timed out after 30s"
           exit 1
 
+      # ── Diagnostics ────────────────────────────
+
+      # gym pipes xcodebuild through xcbeautify, which drops the detail that matters when
+      # signing or provisioning fails — e.g. "Authentication failed" arrives with none of
+      # Apple's actual response attached. The full raw output is tee'd to
+      # ~/Library/Logs/gym/<Project>-<Scheme>.log on the runner and dies with it; stage a
+      # copy as an artifact so a failed run can be diagnosed from the log instead of guessed
+      # at. Contains no secrets: the auth flags in the command line are a file path and the
+      # key/issuer IDs, which the workflow log already prints.
+      - name: Stage raw xcodebuild logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/build-logs"
+          cp -R "$HOME/Library/Logs/gym/." "$RUNNER_TEMP/build-logs/" 2>/dev/null \
+            || echo ":: no gym logs found (failure happened before any xcodebuild run)"
+
+      - name: Upload raw xcodebuild logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-logs
+          path: ${{ runner.temp }}/build-logs/
+          if-no-files-found: ignore
+          retention-days: 5
+
       # ── Cleanup ────────────────────────────────
 
       - name: Delete CI keychain
