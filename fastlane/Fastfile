@@ -46,6 +46,19 @@ platform :ios do
       readonly: false,
     }
 
+    # Certificates-only mode, for callers building with automatic signing.
+    #
+    # Xcode mints its own profiles there, so match must not try to — it would fail on any App
+    # ID that does not exist yet, which is exactly the situation automatic signing is being
+    # used to resolve. The certificate still has to come from match: a CI keychain is empty
+    # every run, so left to itself xcodebuild would request a NEW distribution certificate on
+    # each build and burn through Apple's per-team cap within a few runs. match holds one cert
+    # and its private key in the match repo and reinstalls that same pair every time.
+    if options[:skip_provisioning_profiles].to_s == "true"
+      match_opts[:skip_provisioning_profiles] = true
+      UI.message(":: Certificates only — profiles are xcodebuild's job under automatic signing")
+    end
+
     # Isolate each Apple team's certificates on its own branch in the match repo.
     # Match doesn't support multi-team in a single branch — its cert verification
     # treats every cert in the folder as belonging to the current team and
@@ -80,18 +93,33 @@ platform :ios do
     targets = JSON.parse(options[:targets_json])
 
     match_type = type.to_s == "appstore" ? "AppStore" : "AdHoc"
+    automatic = options[:automatic].to_s == "true"
 
     targets.each do |t|
-      UI.message("Setting signing for target '#{t['name']}' → #{t['bundle_id']}")
-      update_code_signing_settings(
-        use_automatic_signing: false,
-        team_id: team_id,
-        targets: [t["name"]],
-        profile_name: "match #{match_type} #{t['bundle_id']}",
-        code_sign_identity: "Apple Distribution",
-        bundle_identifier: t["bundle_id"],
-        path: xcodeproj,
-      )
+      UI.message("Setting signing for target '#{t['name']}' → #{t['bundle_id']} (#{automatic ? 'automatic' : 'manual'})")
+
+      if automatic
+        # No profile_name and no code_sign_identity: naming either one pins the target back to
+        # a specific match profile/identity, which is the thing automatic signing is here to
+        # stop doing. Xcode resolves both from the team plus the target's entitlements.
+        update_code_signing_settings(
+          use_automatic_signing: true,
+          team_id: team_id,
+          targets: [t["name"]],
+          bundle_identifier: t["bundle_id"],
+          path: xcodeproj,
+        )
+      else
+        update_code_signing_settings(
+          use_automatic_signing: false,
+          team_id: team_id,
+          targets: [t["name"]],
+          profile_name: "match #{match_type} #{t['bundle_id']}",
+          code_sign_identity: "Apple Distribution",
+          bundle_identifier: t["bundle_id"],
+          path: xcodeproj,
+        )
+      end
     end
   end
 
@@ -137,7 +165,7 @@ platform :ios do
 
     project = nil if workspace
 
-    build_app(
+    build_opts = {
       workspace: workspace,
       project: project,
       scheme: options[:scheme],
@@ -146,7 +174,20 @@ platform :ios do
       output_directory: "build/artifacts",
       output_name: "App.ipa",
       clean: true,
-    )
+    }
+
+    # Automatic signing needs xcodebuild to be able to talk to the Developer portal, and gym
+    # injects nothing for that on its own. BOTH phases need it: -allowProvisioningUpdates on
+    # the archive is what registers App IDs, turns on the capabilities the entitlements ask
+    # for, and issues profiles — and the export re-resolves signing, so it needs the same
+    # arguments or it fails at packaging having done all the work.
+    xcargs = options[:xcargs].to_s.strip
+    unless xcargs.empty?
+      build_opts[:xcargs] = xcargs
+      build_opts[:export_xcargs] = xcargs
+    end
+
+    build_app(build_opts)
   end
 
   # ──────────────────────────────────────────────

@@ -55,6 +55,16 @@ on:
         required: false
         type: string
         default: "managed"
+      automatic_signing:
+        description: >-
+          Sign with Xcode automatic signing instead of match profiles. Leave false unless the
+          app needs App IDs that match cannot provision on its own — App Groups and Network
+          Extensions, i.e. an app embedding a tunnel or widget extension. When true, match
+          still supplies the distribution certificate but xcodebuild registers the App IDs,
+          enables their capabilities from each target's entitlements, and issues the profiles.
+        required: false
+        type: boolean
+        default: false
       app_version:
         description: "Marketing version to release (e.g. '1.2.3'). Must be in semver format."
         required: true
@@ -315,6 +325,23 @@ jobs:
 
       # ── Generate ExportOptions ─────────────────
 
+      # Assembled once and reused by every signing/build step below, so the archive and the
+      # export cannot disagree about which mode they are in.
+      - name: Resolve signing mode
+        id: signing
+        run: |
+          if [ "${{ inputs.automatic_signing }}" = "true" ]; then
+            echo "style=automatic" >> "$GITHUB_OUTPUT"
+            echo "skip_profiles=true" >> "$GITHUB_OUTPUT"
+            echo "xcargs=-allowProvisioningUpdates -authenticationKeyPath $ASC_KEY_P8_PATH -authenticationKeyID $APP_STORE_CONNECT_KEY_ID -authenticationKeyIssuerID $APP_STORE_CONNECT_ISSUER_ID" >> "$GITHUB_OUTPUT"
+            echo ":: Signing: automatic (xcodebuild provisions App IDs and capabilities)"
+          else
+            echo "style=manual" >> "$GITHUB_OUTPUT"
+            echo "skip_profiles=false" >> "$GITHUB_OUTPUT"
+            echo "xcargs=" >> "$GITHUB_OUTPUT"
+            echo ":: Signing: manual (match profiles)"
+          fi
+
       - name: Generate ExportOptions plists
         run: |
           mkdir -p build/export-options
@@ -322,13 +349,15 @@ jobs:
             "app-store" \
             "${{ steps.detect.outputs.team_id }}" \
             '${{ steps.detect.outputs.targets_json }}' \
-            "build/export-options/AppStore.plist"
+            "build/export-options/AppStore.plist" \
+            "${{ steps.signing.outputs.style }}"
 
           bash _ci/scripts/generate-export-options.sh \
             "ad-hoc" \
             "${{ steps.detect.outputs.team_id }}" \
             '${{ steps.detect.outputs.targets_json }}' \
-            "build/export-options/AdHoc.plist"
+            "build/export-options/AdHoc.plist" \
+            "${{ steps.signing.outputs.style }}"
 
       # ══════════════════════════════════════════════
       # BUILD: App Store IPA
@@ -339,7 +368,8 @@ jobs:
         run: |
           bundle exec fastlane install_profiles \
             type:appstore \
-            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}"
+            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}" \
+            skip_provisioning_profiles:"${{ steps.signing.outputs.skip_profiles }}"
 
       - name: Set app-store code signing
         working-directory: _ci
@@ -348,6 +378,7 @@ jobs:
             type:appstore \
             targets_json:'${{ steps.detect.outputs.targets_json }}' \
             team_id:"${{ steps.detect.outputs.team_id }}" \
+            automatic:"${{ inputs.automatic_signing }}" \
             xcodeproj:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}"
 
       - name: Build app-store IPA
@@ -368,7 +399,8 @@ jobs:
               project:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}" \
               scheme:"${{ steps.detect.outputs.scheme }}" \
               configuration:"${{ steps.detect.outputs.configuration }}" \
-              export_options:"$GITHUB_WORKSPACE/build/export-options/AppStore.plist"
+              export_options:"$GITHUB_WORKSPACE/build/export-options/AppStore.plist" \
+              xcargs:"${{ steps.signing.outputs.xcargs }}"
           fi
 
       - name: Collect app-store IPA
@@ -431,7 +463,8 @@ jobs:
         run: |
           bundle exec fastlane install_profiles \
             type:adhoc \
-            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}"
+            app_identifiers:"${{ steps.detect.outputs.app_identifiers }}" \
+            skip_provisioning_profiles:"${{ steps.signing.outputs.skip_profiles }}"
 
       - name: Set ad-hoc code signing
         if: inputs.adhoc
@@ -441,6 +474,7 @@ jobs:
             type:adhoc \
             targets_json:'${{ steps.detect.outputs.targets_json }}' \
             team_id:"${{ steps.detect.outputs.team_id }}" \
+            automatic:"${{ inputs.automatic_signing }}" \
             xcodeproj:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}"
 
       - name: Build ad-hoc IPA
@@ -462,7 +496,8 @@ jobs:
               project:"$GITHUB_WORKSPACE/${{ steps.detect.outputs.project }}" \
               scheme:"${{ steps.detect.outputs.scheme }}" \
               configuration:"${{ steps.detect.outputs.configuration }}" \
-              export_options:"$GITHUB_WORKSPACE/build/export-options/AdHoc.plist"
+              export_options:"$GITHUB_WORKSPACE/build/export-options/AdHoc.plist" \
+              xcargs:"${{ steps.signing.outputs.xcargs }}"
           fi
 
       - name: Collect ad-hoc IPA
