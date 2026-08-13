@@ -55,6 +55,16 @@ on:
         required: false
         type: string
         default: "managed"
+      detect_all_targets:
+        description: >-
+          Also enumerate signable targets that the scheme's build action does not list — an
+          app that embeds extensions pulls them in as implicit dependencies, so their bundle
+          IDs are invisible to the default scheme-only query. Leave false unless the repo has
+          extension targets: this list drives match, set_signing and ExportOptions, so an
+          unexpected entry means a profile request for an App ID that may not exist.
+        required: false
+        type: boolean
+        default: false
       automatic_signing:
         description: >-
           Sign with Xcode automatic signing instead of match profiles. Leave false unless the
@@ -235,6 +245,8 @@ jobs:
 
       - name: Pre-detect Xcode project
         id: detect_pre
+        env:
+          DETECT_ALL_TARGETS: ${{ inputs.detect_all_targets }}
         run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}" prepatch
 
       - name: Stamp build version
@@ -271,6 +283,8 @@ jobs:
 
       - name: Detect patched Xcode project
         id: detect
+        env:
+          DETECT_ALL_TARGETS: ${{ inputs.detect_all_targets }}
         run: bash _ci/scripts/detect-project.sh . "${{ inputs.scheme }}" "${{ inputs.configuration }}"
 
       - name: Print detection results

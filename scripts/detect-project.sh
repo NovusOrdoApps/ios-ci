@@ -178,26 +178,39 @@ if [ -z "$SCHEME_SETTINGS" ]; then
   exit 1
 fi
 
-# A scheme only enumerates the targets in its OWN build action. An app that embeds
-# extensions (network extension, widgets) lists just the app there and pulls the rest in as
-# implicit dependencies — so the extensions' bundle IDs never appear, never reach match, and
-# the archive dies with "No profiles for '<app>.tunnel' were found". Ask the project for
-# every target as well and union the two: this can only ADD signable targets, never drop one.
-# Test bundles and non-signable targets are removed by the PRODUCT_TYPE filter below, exactly
-# as they already are for the scheme query.
-ALLTARGET_SETTINGS=$(xcodebuild -showBuildSettings -project "$PROJECT" -alltargets -configuration "$CONFIGURATION" 2>>"$XCB_STDERR" || true)
+# ── OPT-IN: also enumerate targets the scheme does not list ──────────────────────────────
+#
+# A scheme only enumerates the targets in its OWN build action. An app that embeds extensions
+# (network extension, widgets) lists just the app there and pulls the rest in as implicit
+# dependencies — so the extensions' bundle IDs never appear, never reach match, and the archive
+# dies with "No profiles for '<app>.tunnel' were found".
+#
+# OFF BY DEFAULT, and deliberately so. This function's output feeds match (which creates a
+# provisioning profile per bundle ID), set_signing and ExportOptions, so a target appearing
+# here that nobody expected is not a cosmetic difference — it is a profile request for an App
+# ID that may not exist, i.e. a hard failure in a pipeline that ~20 app repos depend on. Every
+# one of those repos has been building fine on the scheme-only list. Opt in per repo with
+# DETECT_ALL_TARGETS=true, which is only needed when the project has signable targets outside
+# the scheme's build action.
+if [ "${DETECT_ALL_TARGETS:-false}" = "true" ]; then
+  ALLTARGET_SETTINGS=$(xcodebuild -showBuildSettings -project "$PROJECT" -alltargets -configuration "$CONFIGURATION" 2>>"$XCB_STDERR" || true)
+
+  # Drop xcodebuild's preamble ("Command line invocation:", "Resolve Package Graph", ...) so
+  # the blob starts on a target header. Without this the preamble lands INSIDE the last block
+  # of the scheme output, because the per-target awk below only stops at the next target
+  # header.
+  ALLTARGET_SETTINGS=$(printf '%s\n' "$ALLTARGET_SETTINGS" \
+    | sed -n '/^Build settings for action build and target /,$p')
+
+  # Union, not replace: -alltargets is scoped to one .xcodeproj, so for a workspace build it
+  # would drop targets living in a sibling project. Order matters — the scheme's blocks come
+  # first, so the awk extraction below (which stops at the next target header) reads the
+  # scheme's copy of any target present in both.
+  SCHEME_SETTINGS=$(printf '%s\n%s\n' "$SCHEME_SETTINGS" "$ALLTARGET_SETTINGS")
+  echo ":: DETECT_ALL_TARGETS=true — also enumerating targets outside the scheme's build action"
+fi
 
 rm -f "$XCB_STDERR"
-
-# Drop xcodebuild's preamble ("Command line invocation:", "Resolve Package Graph", ...) so the
-# blob starts on a target header. Without this the preamble lands INSIDE the last block of the
-# scheme output, because the per-target awk below only stops at the next target header.
-ALLTARGET_SETTINGS=$(printf '%s\n' "$ALLTARGET_SETTINGS" \
-  | sed -n '/^Build settings for action build and target /,$p')
-
-# Order matters: the scheme's blocks come first, so the awk extraction below — which stops at
-# the next target header — reads the scheme's copy of any target present in both.
-SCHEME_SETTINGS=$(printf '%s\n%s\n' "$SCHEME_SETTINGS" "$ALLTARGET_SETTINGS")
 
 TARGETS_RAW=$(printf '%s\n' "$SCHEME_SETTINGS" \
   | sed -n 's/^Build settings for action build and target \(.*\):$/\1/p' \
