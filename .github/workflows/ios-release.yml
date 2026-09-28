@@ -30,11 +30,19 @@ on:
         required: false
         type: boolean
         default: false
-      macos_runner:
-        description: "macOS runner label"
+      xcode_version:
+        description: >-
+          Xcode to build with, e.g. '27.0' or '26.6'. Also picks the runner when macos_runner is
+          empty: 27.x runs on the 'xcode-27' image (macOS 27), anything else on 'macos-26'.
+          Beta Xcodes are refused - App Store Connect rejects builds made with them.
         required: false
         type: string
-        default: "macos-26"
+        default: "27.0"
+      macos_runner:
+        description: "macOS runner label. Leave empty to derive it from xcode_version."
+        required: false
+        type: string
+        default: ""
       ruby_version:
         description: "Ruby version for fastlane"
         required: false
@@ -96,7 +104,8 @@ concurrency:
 jobs:
   build-ios:
     name: Build & Release iOS
-    runs-on: ${{ inputs.macos_runner }}
+    # Xcode 27 ships only on GitHub's separate 'xcode-27' image; every 26.x lives on macos-26.
+    runs-on: ${{ inputs.macos_runner != '' && inputs.macos_runner || (startsWith(inputs.xcode_version, '27') && 'xcode-27' || 'macos-26') }}
     timeout-minutes: 90
 
     permissions:
@@ -130,6 +139,32 @@ jobs:
           token: ${{ secrets.CHECKOUT_PAT }}
 
       # ── Setup tools ────────────────────────────
+
+      # Runner images ship several Xcodes side by side (/Applications/Xcode_<version>.app,
+      # with version aliases as symlinks). Select one explicitly so the build never silently
+      # follows a change to the image's default.
+      - name: Select Xcode
+        env:
+          XCODE_VERSION: ${{ inputs.xcode_version }}
+        run: |
+          XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::Xcode ${XCODE_VERSION} is not installed on runner '${{ runner.name }}'. Available:"
+            ls -d /Applications/Xcode_*.app
+            exit 1
+          fi
+          # Beta aliases (e.g. Xcode_27.1.app) are symlinks onto Xcode_27.1_beta.app.
+          XCODE_REAL="$(cd "$XCODE_APP" && pwd -P)"
+          case "$XCODE_REAL" in
+            *[Bb]eta*)
+              echo "::error::Xcode ${XCODE_VERSION} resolves to $XCODE_REAL, a beta. App Store Connect rejects builds made with beta Xcode."
+              exit 1
+              ;;
+          esac
+          sudo xcode-select -s "$XCODE_REAL/Contents/Developer"
+          echo "DEVELOPER_DIR=$XCODE_REAL/Contents/Developer" >> "$GITHUB_ENV"
+          echo ":: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          xcodebuild -version
 
       - name: Check if Flutter project
         id: flutter_check

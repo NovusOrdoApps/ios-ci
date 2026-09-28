@@ -184,7 +184,8 @@ The caller workflow can override these defaults:
 | Input | Default | Description |
 |---|---|---|
 | `adhoc` | `false` | Also build ad-hoc IPA and upload to Diawi |
-| `macos_runner` | `macos-15` | GitHub Actions runner label |
+| `xcode_version` | `27.0` | Xcode used for the build. `27.x` runs on GitHub's `xcode-27` image (macOS 27); anything else on `macos-26`. Beta Xcodes are refused. Release workflow only. |
+| `macos_runner` | derived from `xcode_version` | GitHub Actions runner label. Set it only to force a specific image. |
 | `ruby_version` | `3.2` | Ruby version for fastlane |
 | `scheme` | auto-detect | Required when the repo has multiple app schemes; for Flutter this is also used as the `--flavor` value |
 | `configuration` | `Release` | Xcode configuration used for validation, detection, and native builds. Flutter currently supports only `Release`. |
