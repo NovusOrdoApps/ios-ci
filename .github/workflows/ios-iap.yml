@@ -32,7 +32,7 @@ on:
         type: string
         default: "macos-26"
       prune_orphans:
-        description: "Delete IAPs on ASC that have no folder in metadata/InAppPurchases/. Only products that never reached review are eligible; approved or sold ones are refused. Off by default — orphans are reported either way."
+        description: "Delete IAPs on ASC that have no folder in metadata/InAppPurchases/ (an absent or empty folder means: delete them all). Only products never approved are eligible; one still inside a review submission needs Cancel Review Submission first, and approved or sold ones are refused. Off by default — orphans are reported either way."
         required: false
         type: boolean
         default: false

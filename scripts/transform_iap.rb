@@ -121,17 +121,28 @@ args = parse_args(ARGV)
 input_dir   = File.expand_path(args[:input])
 output_path = File.expand_path(args[:output])
 
-unless File.directory?(input_dir)
-  fail_with(["Input directory not found: #{input_dir}"])
-end
-
-product_dirs = Dir.children(input_dir)
-  .select { |entry| File.directory?(File.join(input_dir, entry)) }
-  .reject { |entry| entry.start_with?(".") }
-  .sort
+# No folder, or a folder with no product sub-folders, is a legitimate state: an app
+# that sells nothing (or one that removed its last product). It is NOT an error,
+# because the only way to delete the products App Store Connect still holds is to
+# run `update_iap` with `prune_orphans:true` against an EMPTY product list, and
+# failing here would make that impossible. The lane reports every orphan either way.
+product_dirs =
+  if File.directory?(input_dir)
+    Dir.children(input_dir)
+      .select { |entry| File.directory?(File.join(input_dir, entry)) }
+      .reject { |entry| entry.start_with?(".") }
+      .sort
+  else
+    warn(":: #{input_dir} does not exist; treating the app as having no in-app purchases")
+    []
+  end
 
 if product_dirs.empty?
-  fail_with(["No product folders found in #{input_dir}. Each in-app purchase needs its own folder named after its product_id."])
+  FileUtils.mkdir_p(File.dirname(output_path))
+  File.write(output_path, JSON.pretty_generate({ "products" => [] }))
+  puts(":: No in-app purchase folders under #{input_dir}; wrote an empty product list to #{output_path}")
+  puts(":: (products still on App Store Connect are reported by update_iap, and deleted only with prune_orphans:true)")
+  exit(0)
 end
 
 errors = []

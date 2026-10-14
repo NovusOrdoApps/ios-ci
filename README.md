@@ -395,7 +395,9 @@ Every run **reports** such orphans:
 Pass `prune_orphans: true` to delete them. Two guards, both deliberate:
 
 - **Off by default.** A repo that has not committed its IAP folders yet must never have its live products deleted as a side effect of a routine sync.
-- **Only products that never reached review** (`MISSING_METADATA`, `READY_TO_SUBMIT`) are eligible. Anything approved or sold is refused with a warning rather than attempted — it may have been purchased, deleting it would break restores, and Apple rejects the call regardless. Remove those from sale in App Store Connect instead.
+- **Only products that were never approved** are eligible: `MISSING_METADATA`, `WAITING_FOR_UPLOAD`, `PROCESSING_CONTENT`, `READY_TO_SUBMIT`, and a product that went to review with a version and came back `REJECTED` or `DEVELOPER_ACTION_NEEDED`. A product still inside a review submission (`WAITING_FOR_REVIEW`, `IN_REVIEW`, `PENDING_BINARY_APPROVAL`) is refused with the advice to run Cancel Review Submission first. Anything approved or sold is refused with a warning rather than attempted — it may have been purchased, deleting it would break restores, and Apple rejects the call regardless. Remove those from sale in App Store Connect instead. (`attributes.state` can lag the UI by a day, so a refusal is advice; Apple's answer to the DELETE is final and surfaces as a warning.)
+
+**Deleting the last product.** An app that stops selling anything deletes its `metadata/InAppPurchases/` folder and runs the workflow with `prune_orphans: true`: the transform writes an empty product list instead of failing, and the lane deletes every eligible orphan (VONWEB, 2026-10-14). Without `prune_orphans` the same run simply reports what App Store Connect still holds.
 
 ### IAP sync caller workflow
 

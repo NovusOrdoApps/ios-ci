@@ -1252,7 +1252,13 @@ platform :ios do
 
     source = JSON.parse(File.read(input_path))
     products = source.fetch("products", [])
-    UI.user_error!("No products in #{input_path}") if products.empty?
+    if products.empty?
+      # transform_iap.rb writes an empty list when metadata/InAppPurchases/ is
+      # absent or holds no product folders. Nothing to create or update, but the
+      # orphan block below still runs: this is exactly how an app deletes the
+      # last product it no longer sells (prune_orphans:true).
+      UI.important(":: #{input_path} lists no products — nothing to create or update; checking App Store Connect for orphans")
+    end
 
     type_to_apple = {
       "consumable"               => "CONSUMABLE",
@@ -1309,7 +1315,19 @@ platform :ios do
     # permanently. A deleted id cannot be recreated, so a typo'd orphan is
     # removable while the *correct* id remains free to use — but re-adding the
     # deleted id later is not possible.
-    prunable_states = %w[MISSING_METADATA READY_TO_SUBMIT].freeze
+    #
+    # "Never reached review" is wider than READY_TO_SUBMIT: a product that was
+    # submitted with a version and came back REJECTED or DEVELOPER_ACTION_NEEDED
+    # was never approved either, and Apple's UI offers Delete on it (VONWEB,
+    # 2026-10-14, after the owner dropped the paid tier). What is refused is a
+    # product still inside a review submission (WAITING_FOR_REVIEW / IN_REVIEW /
+    # PENDING_BINARY_APPROVAL) — cancel that submission first — and anything
+    # APPROVED or ever on sale. `attributes.state` can lag the UI by a day, so a
+    # refusal here is advice, and Apple's own answer to the DELETE is final.
+    prunable_states = %w[
+      MISSING_METADATA WAITING_FOR_UPLOAD PROCESSING_CONTENT READY_TO_SUBMIT
+      DEVELOPER_ACTION_NEEDED REJECTED
+    ].freeze
     orphan_ids = existing.keys - products.map { |p| p["product_id"] }
     deleted_count = 0
 
@@ -1324,9 +1342,11 @@ platform :ios do
           iap   = existing[pid]
           state = iap.dig("attributes", "state").to_s
           unless prunable_states.include?(state)
+            advice = %w[WAITING_FOR_REVIEW IN_REVIEW PENDING_BINARY_APPROVAL].include?(state) ?
+                     "It is inside a review submission: cancel that submission (Cancel Review Submission), then re-run." :
+                     "A product that was approved or sold can only be removed from sale in App Store Connect, never deleted."
             warnings << "#{pid}: refusing to delete — state is #{state}, not one of " \
-                        "#{prunable_states.join(', ')}. A product that reached review or sale " \
-                        "can only be removed from sale in App Store Connect, never deleted."
+                        "#{prunable_states.join(', ')}. #{advice}"
             next
           end
 
