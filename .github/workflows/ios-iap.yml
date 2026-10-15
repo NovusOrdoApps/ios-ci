@@ -85,10 +85,11 @@ jobs:
         run: |
           : "${APP_BUNDLE_ID:?Missing GitHub Actions variable IOS_RELEASE_APP_BUNDLE_ID}"
 
+          # A missing metadata/InAppPurchases/ is not an error: it means the app sells
+          # nothing (any more). transform_iap.rb then writes an empty product list and
+          # update_iap reports, or with prune_orphans deletes, what ASC still holds.
           if [ ! -d "metadata/InAppPurchases" ]; then
-            echo "ERROR: Expected metadata/InAppPurchases/ directory at the repo root." >&2
-            echo "See ios-ci README for the expected IAP source layout." >&2
-            exit 1
+            echo ":: metadata/InAppPurchases/ is absent — treating the app as having no in-app purchases"
           fi
 
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
