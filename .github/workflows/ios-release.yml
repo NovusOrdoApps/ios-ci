@@ -153,7 +153,11 @@ jobs:
             ls -d /Applications/Xcode_*.app
             exit 1
           fi
-          # Beta aliases (e.g. Xcode_27.1.app) are symlinks onto Xcode_27.1_beta.app.
+          # Version aliases are symlinks onto the real app: Xcode_27.1.app pointed at
+          # Xcode_27.1_beta.app while 27.1 was in beta and at
+          # Xcode_27.1_Release_Candidate.app once the RC shipped (2026-10). Only the
+          # beta is refused: an RC carries the final SDK and App Store Connect accepts
+          # builds made with it.
           XCODE_REAL="$(cd "$XCODE_APP" && pwd -P)"
           case "$XCODE_REAL" in
             *[Bb]eta*)
