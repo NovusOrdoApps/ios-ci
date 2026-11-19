@@ -10,13 +10,23 @@ require "open3"
 # with neighboring display types. For example, APP_IPHONE_65 accepts
 # 1284x2778 even though that's the "6.7" Display" portrait size, because
 # Apple lets you upload 6.7" screenshots to satisfy the 6.5" requirement.
+#
+# APP_IPHONE_DUO (iPhone Duo, foldable) is ONE set for both of its displays:
+# outer/cover 1398x2034 and inner 2007x2853, either orientation, share the
+# same folder and Apple's 10-per-set cap. The constant is accepted by the live
+# App Store Connect API (verified by several tools in Oct 2026) but is absent
+# from Apple's OpenAPI 4.5.1 and from fastlane before 2.242.0; see
+# update_screenshots in the Fastfile for how the upload side handles that.
+# Duo screenshots are optional until April 2027, then required for apps built
+# with the iOS 27.1 SDK or later.
 DEVICE_DIMENSIONS = {
-  "APP_IPHONE_67"         => [[1290, 2796], [1284, 2778]],               # iPhone 6.7"
+  "APP_IPHONE_67"         => [[1290, 2796], [1284, 2778], [1320, 2868]], # iPhone 6.7" (6.9" captures accepted here too)
   "APP_IPHONE_65"         => [[1242, 2688], [1284, 2778], [1290, 2796]], # iPhone 6.5" (also accepts 6.7" sizes)
   "APP_IPHONE_61"         => [[1179, 2556], [1170, 2532], [1125, 2436]], # iPhone 6.1"
   "APP_IPHONE_58"         => [[1125, 2436]],                             # iPhone 5.8"
   "APP_IPHONE_55"         => [[1242, 2208]],                             # iPhone 5.5"
   "APP_IPHONE_47"         => [[750, 1334]],                              # iPhone 4.7"
+  "APP_IPHONE_DUO"        => [[1398, 2034], [2007, 2853]],               # iPhone Duo: outer + inner display, one set
   "APP_IPAD_PRO_3GEN_129" => [[2048, 2732], [2064, 2752]],               # iPad Pro 12.9" 3rd gen+
   "APP_IPAD_PRO_129"      => [[2048, 2732]],                             # iPad Pro 12.9" 2nd gen
   "APP_IPAD_PRO_3GEN_11"  => [[1668, 2388], [1668, 2420], [1488, 2266]], # iPad Pro 11"

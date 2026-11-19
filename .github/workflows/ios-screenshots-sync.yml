@@ -4,7 +4,7 @@
 # saves them to metadata/Screenshots/{locale}/{display_type}/ and opens a PR.
 #
 # Uses Apple's actual display type constants as folder names
-# (e.g., APP_IPHONE_67, APP_IPAD_PRO_3GEN_129).
+# (e.g., APP_IPHONE_67, APP_IPHONE_DUO, APP_IPAD_PRO_3GEN_129).
 #
 # Required repo secrets:
 #   APP_STORE_CONNECT_API_KEY_P8
@@ -160,7 +160,7 @@ jobs:
 
           Files are organized as `metadata/Screenshots/{locale}/{display_type}/NN.png`.
 
-          Display types use Apple's actual constants (e.g., `APP_IPHONE_67`, `APP_IPAD_PRO_3GEN_129`).
+          Display types use Apple's actual constants (e.g., `APP_IPHONE_67`, `APP_IPHONE_DUO`, `APP_IPAD_PRO_3GEN_129`).
 
           **Review the screenshots and merge when ready.**
           BODY

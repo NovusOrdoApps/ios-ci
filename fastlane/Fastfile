@@ -590,7 +590,7 @@ platform :ios do
   #   {output_path}/Screenshots/{locale}/{display_type}/01.png, 02.png, ...
   #
   # display_type uses Apple's actual constants (e.g. APP_IPHONE_67,
-  # APP_IPAD_PRO_3GEN_129, APP_IPAD_PRO_3GEN_11).
+  # APP_IPHONE_DUO, APP_IPAD_PRO_3GEN_129, APP_IPAD_PRO_3GEN_11).
   #
   # Usage: bundle exec fastlane fetch_screenshots output_path:/path/to/repo
   # ──────────────────────────────────────────────
@@ -1055,7 +1055,15 @@ platform :ios do
 
     # Apple display_type constants, longest-first so the longest matching
     # filename prefix wins (e.g. APP_IPAD_PRO_3GEN_129 before APP_IPAD_PRO_129).
-    display_types = Spaceship::ConnectAPI::AppScreenshotSet::DisplayType::ALL.sort_by { |dt| -dt.length }
+    #
+    # extra_display_types: constants the live API accepts but the pinned
+    # fastlane (2.233.1) does not list yet. APP_IPHONE_DUO (iPhone Duo, one set
+    # for both displays) landed in fastlane 2.242.0. create_app_screenshot_set
+    # sends the string verbatim, so no gem bump is needed for the upload to
+    # work. Drop this list once Gemfile.lock is at fastlane >= 2.242.0.
+    extra_display_types = %w[APP_IPHONE_DUO]
+    display_types = (Spaceship::ConnectAPI::AppScreenshotSet::DisplayType::ALL + extra_display_types)
+                      .uniq.sort_by { |dt| -dt.length }
 
     app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
     UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app

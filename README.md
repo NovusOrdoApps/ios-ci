@@ -235,11 +235,12 @@ metadata/
 │       └── ...
 └── Screenshots/
     └── en/
-        ├── APP_IPHONE_67/      # 1290x2796
-        ├── APP_IPHONE_65/      # 1284x2778
-        ├── APP_IPHONE_55/      # 1242x2208
-        ├── APP_IPAD_129/       # 2048x2732
-        └── APP_IPAD_110/       # 1668x2388
+        ├── APP_IPHONE_67/          # 1290x2796 (6.9" captures 1320x2868 accepted here too)
+        ├── APP_IPHONE_65/          # 1284x2778 or 1242x2688
+        ├── APP_IPHONE_61/          # 1179x2556 or 1170x2532
+        ├── APP_IPHONE_DUO/         # iPhone Duo: 1398x2034 (outer) and 2007x2853 (inner), ONE folder
+        ├── APP_IPAD_PRO_3GEN_129/  # 2048x2732 or 2064x2752
+        └── APP_IPAD_PRO_3GEN_11/   # 1668x2388
 ```
 
 **info.jsonc** supports comments and maps these fields to App Store Connect:
@@ -262,6 +263,10 @@ metadata/
 - `update_whatsnew_only: false` — All fields from `defaults/` + locale folders are uploaded. Use this for initial setup or full metadata refresh.
 
 **Screenshots:** Must be PNG, within 20px of the target device dimensions. The workflow automatically scales to exact dimensions and strips the alpha channel.
+
+Folder names are Apple's App Store Connect `screenshotDisplayType` constants, spelled exactly; the full list with every accepted size is `DEVICE_DIMENSIONS` in `scripts/transform_screenshots.rb`, and an unknown folder name fails the run before anything is uploaded. Files inside a folder are uploaded in filename order (`01.png`, `02.png`, ...), at most 10 per folder. Landscape captures are detected from the image itself and matched against the landscape form of the same sizes.
+
+**iPhone Duo** uses one display type, `APP_IPHONE_DUO`, for both of its screens: outer (cover) captures at 1398x2034 and inner captures at 2007x2853 (or 2034x1398 / 2853x2007 landscape) go in the same `APP_IPHONE_DUO/` folder and share its 10 slots. Apple accepts Duo screenshots since October 2026; starting April 2027 they are required for any app built with the iOS 27.1 SDK or later.
 
 ### Metadata workflow inputs
 
