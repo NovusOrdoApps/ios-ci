@@ -255,6 +255,12 @@ platform :ios do
         File.directory?(File.join(screenshots_dir, entry))
       end
     end
+    creative_dir = File.join(metadata_root, "CreativeAssets")
+    if File.directory?(creative_dir)
+      repo_locales += Dir.children(creative_dir).select do |entry|
+        entry != "defaults" && File.directory?(File.join(creative_dir, entry))
+      end
+    end
     repo_locales = repo_locales.uniq.sort
 
     if repo_locales.empty?
@@ -1219,6 +1225,160 @@ platform :ios do
     end
 
     UI.success("Uploaded #{total} screenshot(s) deterministically (deliver bypassed).")
+  end
+
+  # ──────────────────────────────────────────────
+  # update_creative_assets
+  #
+  # iOS 27 "creative assets": the product page header (3840x1646, shown at the
+  # top of the product page on iOS/iPadOS 27+) and the search results artwork.
+  # Apple exposes them only through the App Asset Library (public API 4.5.1+).
+  # fastlane (<= 2.242.0) has no model for any of it, so this lane talks to the
+  # endpoints directly through the JWT client, exactly like the IAP review
+  # screenshot upload does. Public API only; never iris / cookie session.
+  #
+  #   1. GET  /v1/apps/{id}/assetLibrary                      -> library id
+  #   2. GET  /v1/appAssetLibraryRefData                      -> placement groups per type
+  #      (Apple: group ids are catalog data, not an enum; read, never hard-code)
+  #   3. per distinct file: GET /v1/appAssetLibraries/{lib}/images
+  #        ?filter[referenceName]=sha256:<hash>   reuse an earlier upload, else
+  #      POST /v1/appAssetLibraryImages (category CREATIVE_ASSETS, fileName,
+  #        fileSize, referenceName) -> PUT the uploadOperations -> PATCH
+  #        uploaded:true -> poll state past UPLOAD_COMPLETE (this API has no
+  #        sourceFileChecksum; state is the only signal)
+  #   4. per localization of the EDITABLE version and per type: list placements,
+  #      keep the one already pointing at our image, delete the rest, POST
+  #      /v1/appAssetLibraryPlacements for what is missing (one per group the
+  #      catalog allows, or one ungrouped placement when it names none).
+  #
+  # Repo is the source of truth: a locale with no file for a type loses that
+  # type's placements. Placements are reviewed with the version; nothing else
+  # to submit. Requires an EDITABLE version, like update_screenshots.
+  #
+  # Input: the manifest written by scripts/transform_creative_assets.rb.
+  # Usage: bundle exec fastlane update_creative_assets manifest:/path/manifest.json
+  # ──────────────────────────────────────────────
+  lane :update_creative_assets do |options|
+    require "spaceship"
+    require "json"
+    load_creative_assets_catalog
+
+    app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_P8_PATH"),
+    )
+
+    manifest_path = options[:manifest].to_s
+    UI.user_error!("Missing manifest") if manifest_path.empty?
+    UI.user_error!("manifest not found: #{manifest_path}") unless File.file?(manifest_path)
+    manifest = JSON.parse(File.read(manifest_path))
+    base_dir = File.dirname(manifest_path)
+    processing_timeout = (options[:processing_timeout] || ENV["ASSET_PROCESSING_TIMEOUT"] || 300).to_i
+    types = Array(manifest["placement_types"])
+    assets = Array(manifest["assets"])
+    manifest_locales = Array(manifest["locales"]).sort
+
+    app = Spaceship::ConnectAPI::App.find(ENV.fetch("APP_BUNDLE_ID"))
+    UI.user_error!("App not found: #{ENV.fetch('APP_BUNDLE_ID')}") unless app
+
+    version = app.get_edit_app_store_version
+    if version.nil?
+      UI.user_error!(
+        "No EDITABLE App Store version found. Creative assets can only be placed on an " \
+        "editable version — create/prepare a new version first (release.yml), then re-run.",
+      )
+    end
+    UI.message(":: Placing creative assets on editable version #{version.version_string} (state: #{version.app_store_state})")
+
+    loc_by_locale = version.get_app_store_version_localizations.each_with_object({}) do |loc, h|
+      h[loc.locale] = loc
+    end
+
+    lib_id = asset_lib_client.get("v1/apps/#{app.id}/assetLibrary").body.dig("data", "id")
+    UI.user_error!("GET /v1/apps/#{app.id}/assetLibrary returned no library id") if lib_id.to_s.empty?
+    UI.message(":: Asset library #{lib_id}")
+
+    ref_body = asset_lib_client.get("v1/appAssetLibraryRefData").body
+    groups_by_type = types.each_with_object({}) do |type, h|
+      groups = CreativeAssetsCatalog.placement_groups(ref_body, type)
+      if groups.empty?
+        UI.important(":: #{type}: reference data lists no placement group; placing without placementGroup")
+        groups = [{ "group" => nil, "max" => 1 }]
+      end
+      h[type] = groups
+      UI.message(":: #{type}: group(s) #{groups.map { |g| g['group'] || '(none)' }.join(', ')}, max #{groups.map { |g| g['max'] }.compact.min || '?'} per group")
+    end
+
+    # 3. one library asset per distinct file, keyed by content hash
+    image_ids = {}
+    assets.each do |asset|
+      path = File.expand_path(asset["file"], base_dir)
+      UI.user_error!("asset file missing: #{path}") unless File.file?(path)
+      ref = asset["reference_name"].to_s
+      UI.user_error!("asset without reference_name in manifest: #{asset.inspect}") if ref.empty?
+
+      existing = find_library_image(lib_id: lib_id, reference_name: ref)
+      if existing
+        UI.message(":: #{asset['kind']}: reusing library image #{existing['id']} (#{ref[0, 19]}..., state #{existing.dig('attributes', 'state')})")
+        attrs = wait_for_library_image(existing["id"], processing_timeout)
+        image_ids[ref] = existing["id"]
+      else
+        UI.message(":: #{asset['kind']}: uploading #{asset['source']} (#{asset['width']}x#{asset['height']}) as #{ref[0, 19]}...")
+        id, attrs = upload_library_image(lib_id: lib_id, path: path, reference_name: ref, processing_timeout: processing_timeout)
+        image_ids[ref] = id
+      end
+
+      expected = CreativeAssetsCatalog.spec_ids(ref_body, asset["placement_type"])
+      spec = attrs["specId"]
+      if spec && !expected.empty? && !expected.include?(spec.to_s)
+        UI.important(":: #{asset['kind']}: Apple matched spec #{spec}; the catalog maps #{expected.join(', ')} to #{asset['placement_type']} — the placement may be refused")
+      else
+        UI.message(":: #{asset['kind']}: processed (state #{attrs['state']}, spec #{spec || '?'})")
+      end
+    end
+
+    # 4. reconcile placements: per locale, per type, per group
+    created = 0
+    kept = 0
+    deleted = 0
+    manifest_locales.each do |locale|
+      loc = loc_by_locale[locale]
+      if loc.nil?
+        UI.important(":: Skipping #{locale}: no matching localization on the editable version.")
+        next
+      end
+
+      types.each do |type|
+        asset = assets.find { |a| a["placement_type"] == type && Array(a["locales"]).include?(locale) }
+        want_image = asset && image_ids[asset["reference_name"]]
+        existing = list_placements(loc.id, type)
+
+        if want_image.nil?
+          existing.each { |p| delete_placement(p["id"]); deleted += 1 }
+          UI.message(":: #{locale}/#{type}: no file in repo#{existing.empty? ? '' : ", removed #{existing.size} placement(s)"}")
+          next
+        end
+
+        plan = CreativeAssetsCatalog.reconcile_plan(existing, want_image, groups_by_type[type])
+        plan[:keep].each do |p|
+          kept += 1
+          UI.message(":: #{locale}/#{type}: already placed (#{p['id']}, group #{p.dig('attributes', 'placementGroup') || '(none)'}, state #{p.dig('attributes', 'state')})")
+        end
+        plan[:delete].each do |p|
+          delete_placement(p["id"])
+          deleted += 1
+          UI.message(":: #{locale}/#{type}: removed placement #{p['id']} (group #{p.dig('attributes', 'placementGroup') || '(none)'}, image #{p.dig('relationships', 'image', 'data', 'id')})")
+        end
+        plan[:create].each do |group|
+          pid = create_placement(loc_id: loc.id, image_id: want_image, placement_type: type, group: group)
+          created += 1
+          UI.message(":: #{locale}/#{type}: placed (#{pid}, group #{group || '(none)'})")
+        end
+      end
+    end
+
+    UI.success("Creative assets: #{created} placement(s) created, #{kept} kept, #{deleted} removed across #{manifest_locales.size} locale(s). They go to App Review with the version.")
   end
 
   # ──────────────────────────────────────────────
@@ -2243,6 +2403,122 @@ platform :ios do
   #   iap.dig("attributes", "inAppPurchaseType")  → "CONSUMABLE" / "NON_CONSUMABLE" / etc.
   #   iap.dig("attributes", "familySharable")
   #   iap.dig("attributes", "state")              → "MISSING_METADATA" / "READY_TO_SUBMIT" / etc.
+
+  # ── Creative assets: App Asset Library over the public API (JWT) ────────
+  # Pure parsing lives in scripts/creative_assets_catalog.rb (shared with the
+  # transform script, unit-testable without fastlane).
+  def load_creative_assets_catalog
+    return if defined?(CreativeAssetsCatalog)
+    candidates = []
+    candidates << File.expand_path("../scripts/creative_assets_catalog.rb", __dir__) if __dir__
+    candidates << File.expand_path("scripts/creative_assets_catalog.rb", Dir.pwd)
+    path = candidates.find { |c| File.file?(c) }
+    UI.user_error!("creative_assets_catalog.rb not found (looked in #{candidates.join(', ')})") unless path
+    require path
+  end
+
+  # The token-bearing client: with app_store_connect_api_key set, every call goes
+  # to https://api.appstoreconnect.apple.com/ (see Spaceship api_client#hostname).
+  def asset_lib_client
+    Spaceship::ConnectAPI.client.tunes_request_client
+  end
+
+  def find_library_image(lib_id:, reference_name:)
+    resp = asset_lib_client.get(
+      "v1/appAssetLibraries/#{lib_id}/images",
+      { "filter[referenceName]" => reference_name, "filter[category]" => CreativeAssetsCatalog::CATEGORY, "limit" => 50 }
+    )
+    (resp.body["data"] || []).find do |img|
+      img.dig("attributes", "referenceName") == reference_name &&
+        !%w[FAILED ARCHIVED].include?(img.dig("attributes", "state"))
+    end
+  end
+
+  # Reserve -> PUT parts -> commit (uploaded:true, no checksum in this API) ->
+  # wait for processing. Returns [image_id, attributes].
+  def upload_library_image(lib_id:, path:, reference_name:, processing_timeout:)
+    bytes = File.binread(path)
+    create = asset_lib_client.post("v1/appAssetLibraryImages", {
+      data: {
+        type: "appAssetLibraryImages",
+        attributes: {
+          category: CreativeAssetsCatalog::CATEGORY,
+          fileName: File.basename(path),
+          fileSize: bytes.bytesize,
+          referenceName: reference_name,
+        },
+        relationships: { assetLibrary: { data: { type: "appAssetLibraries", id: lib_id } } },
+      },
+    })
+    img_id = create.body.dig("data", "id")
+    ops = create.body.dig("data", "attributes", "uploadOperations") || []
+    UI.user_error!("reserve of #{File.basename(path)} returned no id/uploadOperations: #{create.body.inspect[0, 400]}") if img_id.to_s.empty? || ops.empty?
+
+    Spaceship::ConnectAPI::FileUploader.upload(ops, bytes)
+
+    asset_lib_client.patch("v1/appAssetLibraryImages/#{img_id}", {
+      data: { type: "appAssetLibraryImages", id: img_id, attributes: { uploaded: true } },
+    })
+    [img_id, wait_for_library_image(img_id, processing_timeout)]
+  end
+
+  # Poll until Apple has processed the file. AWAITING_UPLOAD / UPLOAD_COMPLETE
+  # mean "still working"; FAILED is fatal; anything else (COMPLETE,
+  # PREPARE_FOR_SUBMISSION, ... APPROVED) means the asset is usable.
+  def wait_for_library_image(img_id, timeout)
+    deadline = Time.now + timeout
+    loop do
+      attrs = asset_lib_client.get("v1/appAssetLibraryImages/#{img_id}").body.dig("data", "attributes") || {}
+      state = attrs["state"].to_s
+      case state
+      when "FAILED"
+        details = Array(attrs["stateDetails"]).map { |d| d.is_a?(Hash) ? (d["description"] || d["message"] || d.to_s) : d.to_s }.join("; ")
+        UI.user_error!("library image #{img_id} FAILED processing: #{details}")
+      when "AWAITING_UPLOAD", "UPLOAD_COMPLETE", ""
+        UI.user_error!("library image #{img_id}: timed out after #{timeout}s (last state: #{state.inspect})") if Time.now > deadline
+        sleep(3)
+      else
+        return attrs
+      end
+    end
+  end
+
+  def list_placements(loc_id, placement_type)
+    resp = asset_lib_client.get(
+      "v1/appStoreVersionLocalizations/#{loc_id}/placements",
+      { "filter[placementType]" => placement_type, "include" => "image", "limit" => 50 }
+    )
+    resp.body["data"] || []
+  end
+
+  def create_placement(loc_id:, image_id:, placement_type:, group: nil)
+    attrs = { placementType: placement_type }
+    attrs[:placementGroup] = group if group
+    resp = asset_lib_client.post("v1/appAssetLibraryPlacements", {
+      data: {
+        type: "appAssetLibraryPlacements",
+        attributes: attrs,
+        relationships: {
+          image: { data: { type: "appAssetLibraryImages", id: image_id } },
+          appStoreVersionLocalization: { data: { type: "appStoreVersionLocalizations", id: loc_id } },
+        },
+      },
+    })
+    data = resp.body["data"] || {}
+    if data.dig("attributes", "state") == "FAILED"
+      UI.user_error!("placement #{data['id']} FAILED: #{Array(data.dig('attributes', 'stateDetails')).inspect}")
+    end
+    data["id"]
+  rescue Spaceship::UnexpectedResponse => e
+    UI.user_error!(
+      "POST /v1/appAssetLibraryPlacements (#{placement_type}#{group ? ", group #{group}" : ''}) was refused: #{e.message}. " \
+      "Check GET /v1/appAssetLibraryRefData for the groups and specs this type accepts, and that the version is still editable.",
+    )
+  end
+
+  def delete_placement(id)
+    asset_lib_client.delete("v1/appAssetLibraryPlacements/#{id}")
+  end
 
   def iap_client
     Spaceship::ConnectAPI.client.tunes_request_client

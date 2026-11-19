@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: true
+      skip_creative_assets:
+        description: "Skip iOS 27 creative assets (product page header, search results artwork) from metadata/CreativeAssets/"
+        required: false
+        type: boolean
+        default: true
       update_whatsnew_only:
         description: "Only update release notes (What's New). All other metadata is left untouched on App Store Connect."
         required: false
@@ -107,6 +112,7 @@ jobs:
           echo ":: App Bundle ID: $APP_BUNDLE_ID"
           echo ":: App Version: ${{ inputs.app_version || '(current draft)' }}"
           echo ":: Skip Screenshots: ${{ inputs.skip_screenshots }}"
+          echo ":: Skip Creative Assets: ${{ inputs.skip_creative_assets }}"
           echo ":: Update WhatsNew Only: ${{ inputs.update_whatsnew_only }}"
           echo ":: Update Promotional Text Only: ${{ inputs.update_promotional_text_only }}"
 
@@ -153,6 +159,27 @@ jobs:
         run: |
           bundle exec fastlane update_screenshots \
             screenshots_path:"$RUNNER_TEMP/deliver-metadata/screenshots"
+
+      # iOS 27 creative assets (product page header 3840x1646, search results
+      # artwork) go through the App Asset Library, a different API from
+      # screenshot sets. transform_creative_assets.rb resolves defaults/ vs
+      # <locale>/ files, validates sizes, strips alpha and writes a manifest;
+      # update_creative_assets uploads each distinct file once and places it on
+      # every localization of the editable version. Public API (JWT) only.
+      - name: Transform creative assets
+        if: ${{ inputs.skip_creative_assets == false }}
+        run: |
+          ruby _ci/scripts/transform_creative_assets.rb \
+            --input "$GITHUB_WORKSPACE/metadata/CreativeAssets" \
+            --output "$RUNNER_TEMP/deliver-metadata/creative-assets" \
+            --locales "${{ steps.locales.outputs.locales }}"
+
+      - name: Upload creative assets to App Store Connect
+        if: ${{ inputs.skip_creative_assets == false }}
+        working-directory: _ci
+        run: |
+          bundle exec fastlane update_creative_assets \
+            manifest:"$RUNNER_TEMP/deliver-metadata/creative-assets/manifest.json"
 
       - name: Cleanup
         if: always()

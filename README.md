@@ -233,14 +233,20 @@ metadata/
 │   │   └── whatsNew.txt        # Optional localized release notes
 │   └── ru/
 │       └── ...
-└── Screenshots/
-    └── en/
-        ├── APP_IPHONE_67/          # 1290x2796 (6.9" captures 1320x2868 accepted here too)
-        ├── APP_IPHONE_65/          # 1284x2778 or 1242x2688
-        ├── APP_IPHONE_61/          # 1179x2556 or 1170x2532
-        ├── APP_IPHONE_DUO/         # iPhone Duo: 1398x2034 (outer) and 2007x2853 (inner), ONE folder
-        ├── APP_IPAD_PRO_3GEN_129/  # 2048x2732 or 2064x2752
-        └── APP_IPAD_PRO_3GEN_11/   # 1668x2388
+├── Screenshots/
+│   └── en/
+│       ├── APP_IPHONE_67/          # 1290x2796 (6.9" captures 1320x2868 accepted here too)
+│       ├── APP_IPHONE_65/          # 1284x2778 or 1242x2688
+│       ├── APP_IPHONE_61/          # 1179x2556 or 1170x2532
+│       ├── APP_IPHONE_DUO/         # iPhone Duo: 1398x2034 (outer) and 2007x2853 (inner), ONE folder
+│       ├── APP_IPAD_PRO_3GEN_129/  # 2048x2732 or 2064x2752
+│       └── APP_IPAD_PRO_3GEN_11/   # 1668x2388
+└── CreativeAssets/                 # optional, iOS 27 (see "Creative assets" below)
+    ├── defaults/
+    │   ├── product_page_header.png # 3840x1646, every locale
+    │   └── search_results.png      # optional, 3:2
+    └── ru/
+        └── product_page_header.png # per-locale override
 ```
 
 **info.jsonc** supports comments and maps these fields to App Store Connect:
@@ -268,12 +274,28 @@ Folder names are Apple's App Store Connect `screenshotDisplayType` constants, sp
 
 **iPhone Duo** uses one display type, `APP_IPHONE_DUO`, for both of its screens: outer (cover) captures at 1398x2034 and inner captures at 2007x2853 (or 2034x1398 / 2853x2007 landscape) go in the same `APP_IPHONE_DUO/` folder and share its 10 slots. Apple accepts Duo screenshots since October 2026; starting April 2027 they are required for any app built with the iOS 27.1 SDK or later.
 
+### Creative assets (iOS 27 product page header)
+
+Since iOS 27 the App Store shows an optional **product page header** image across the top of the product page, and an optional **search results** artwork. Apple stores both in the App Asset Library, a different API from screenshot sets, and shows them only on iOS 27 / iPadOS 27 and later; older clients see the page unchanged. The repo convention mirrors `Text/`: `defaults/` applies to every locale, a locale folder overrides it.
+
+| File (under `metadata/CreativeAssets/defaults/` or `<locale>/`) | Size | Notes |
+|---|---|---|
+| `product_page_header.png` (or `.jpg`) | 3840x1646 exact, 21:9; within 20px is scaled | no alpha (stripped automatically); safe area 1646x661 at (1097, 493), outside it may be cropped on some devices |
+| `search_results.png` (or `.jpg`) | 3:2, between 1920x1280 and 3840x2560, kept as-is | optional; without it the store falls back to screenshots and previews |
+
+File names are fixed; anything else under `CreativeAssets/` fails validation before upload. Apple's content rules apply: no prices or discounts, no URLs, no awards or Apple badges, no other platforms' logos, suitable for a 4+ audience.
+
+Run the Metadata workflow with `skip_creative_assets: false`. `transform_creative_assets.rb` validates the files, strips alpha, writes one processed file per distinct image plus a manifest; the `update_creative_assets` lane uploads each file once into the app's library (tagged with its content hash, so re-runs reuse it) and places it on every localization of the editable version, replacing whatever placement of that type was there. A locale with no file loses that type's placement: the repo is the source of truth, like screenshots. Placements ride along with the version through App Review; nothing extra to submit. Public API (JWT) only, like every lane here.
+
+Status: built from Apple's published API spec and guide (2026-11-19), not yet run against Apple. The first live run confirms the placement group ids the reference data returns for the header.
+
 ### Metadata workflow inputs
 
 | Input | Default | Description |
 |---|---|---|
 | `app_version` | `""` | Target app version. Empty = update current draft |
 | `skip_screenshots` | `true` | Skip screenshot upload |
+| `skip_creative_assets` | `true` | Skip iOS 27 creative assets (product page header, search results) from `metadata/CreativeAssets/` |
 | `update_whatsnew_only` | `true` | Only update release notes. All other metadata is left untouched on ASC |
 
 ### Metadata caller workflow
@@ -487,6 +509,8 @@ ios-ci/
     ├── generate-export-options.sh  # Builds ExportOptions.plist dynamically
     ├── transform_metadata.rb       # Transforms custom metadata format to deliver format
     ├── transform_screenshots.rb    # Validates and processes screenshots for App Store
+    ├── transform_creative_assets.rb # iOS 27 header/search artwork: defaults vs locale, validation, manifest
+    ├── creative_assets_catalog.rb  # Shared creative-asset sizes, ref-data parsing, placement reconcile plan
     ├── reverse_transform_metadata.rb  # Converts deliver format to custom metadata format (for sync)
     ├── transform_iap.rb            # Validates IAP source folder, emits normalized JSON
     └── reverse_transform_iap.rb    # Converts ASC IAP dump back into the source layout
