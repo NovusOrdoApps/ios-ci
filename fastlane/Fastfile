@@ -1760,7 +1760,12 @@ platform :ios do
     identifier = options[:identifier] || ENV["APP_BUNDLE_ID"]
     UI.user_error!("Missing identifier (or APP_BUNDLE_ID env)") if identifier.to_s.empty?
 
-    name = options[:name] || identifier
+    # The bundle ID "name" is the Developer-portal description, not the App Store name, and Apple
+    # accepts only letters, digits and spaces there. asc-init passes the App Store name verbatim, so
+    # "INCI Net: Website Checker" was refused with "The attribute 'name' is invalid" (incinet run
+    # 44706253033, 2026-11-20). Everything else becomes a space; the App Store name is untouched.
+    name = (options[:name] || identifier).to_s.gsub(/[^A-Za-z0-9 ]+/, " ").squeeze(" ").strip
+    name = identifier.to_s.gsub(/[^A-Za-z0-9]+/, " ").strip if name.empty?
     platform = options[:platform] || "UNIVERSAL"   # IOS | MAC_OS | UNIVERSAL
 
     UI.user_error!("Invalid platform #{platform.inspect}; valid: IOS | MAC_OS | UNIVERSAL") \
